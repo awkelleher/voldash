@@ -13,6 +13,8 @@ import os
 
 def parse_price_sheet(xl_file, sheet_name, commodity_name):
     """Parse a commodity sheet from the Excel file"""
+    from datetime import datetime, timedelta
+    
     print(f"  Parsing {commodity_name}...")
     
     # Read the sheet
@@ -46,9 +48,26 @@ def parse_price_sheet(xl_file, sheet_name, commodity_name):
                 if pd.isna(date_val) or date_val == '':
                     continue
                 
-                # Try to parse date
+                # Try to parse date - handle both datetime objects and Excel serial numbers
                 try:
-                    date = pd.to_datetime(date_val)
+                    # If it's already a datetime, use it
+                    if isinstance(date_val, pd.Timestamp):
+                        date = date_val
+                    # If it's a number (Excel serial number), convert it
+                    elif isinstance(date_val, (int, float)):
+                        # Excel serial date (days since 1900-01-01, with bug for 1900 leap year)
+                        date = pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(date_val))
+                    else:
+                        # Try parsing as string
+                        date = pd.to_datetime(date_val)
+                    
+                    # Filter out bad dates
+                    min_valid_date = datetime(2000, 1, 1)
+                    max_valid_date = datetime.now() + timedelta(days=3650)
+                    
+                    if date < min_valid_date or date > max_valid_date:
+                        continue
+                        
                 except:
                     continue
                 
@@ -152,7 +171,17 @@ def update_from_hertz_file(hertz_path='C:/Users/AdamKelleher/OneDrive - Prime Tr
     
     if os.path.exists(historical_file):
         print(f"\nLoading existing data from {historical_file}...")
-        existing_df = pd.read_csv(historical_file, parse_dates=['date'])
+        existing_df = pd.read_csv(historical_file)
+        
+        # Convert date column to datetime - handle mixed formats
+        existing_df['date'] = pd.to_datetime(existing_df['date'], format='mixed', errors='coerce')
+        
+        # Drop any rows where date conversion failed
+        before_drop = len(existing_df)
+        existing_df = existing_df.dropna(subset=['date'])
+        if before_drop != len(existing_df):
+            print(f"  ⚠️  Dropped {before_drop - len(existing_df)} rows with invalid dates")
+        
         print(f"  Existing: {len(existing_df):,} records")
         print(f"  Date range: {existing_df['date'].min().date()} to {existing_df['date'].max().date()}")
         

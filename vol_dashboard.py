@@ -6,6 +6,7 @@ Consolidates key metrics for options trading analysis
 import streamlit as st
 import pandas as pd
 import numpy as np
+import textwrap
 import vol_analysis as va
 import variance_ratios as vr
 from datetime import datetime, timedelta
@@ -22,6 +23,11 @@ st.set_page_config(
 def load_data():
     """Load historical data with caching"""
     return va.load_historical_data()
+
+@st.cache_data
+def load_master():
+    """Load master historical vol/skew data (for percentiles/skew)"""
+    return va.load_master_data()
 
 @st.cache_data(ttl=10)  # Cache for only 10 seconds for live data
 def load_live_vols():
@@ -49,23 +55,153 @@ def load_price_data():
         pass
     return None
 
-# Custom CSS for better formatting
+# Bloomberg-style dark theme CSS
 st.markdown("""
     <style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 10px;
-        border-radius: 5px;
-        margin: 5px 0;
+    /* ---- Global dark overrides ---- */
+    .stApp {
+        background-color: #0a0e17;
+        color: #c8cdd3;
     }
-    .stMetric label {
-        font-size: 14px;
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: #0f1419;
+        border-right: 1px solid #1e2530;
+    }
+    section[data-testid="stSidebar"] .stMarkdown p,
+    section[data-testid="stSidebar"] .stMarkdown span,
+    section[data-testid="stSidebar"] label {
+        color: #8b949e;
+    }
+
+    /* Headers */
+    h1, h2, h3, h4, h5, h6 {
+        color: #e6edf3 !important;
+        font-family: 'Consolas', 'Monaco', 'Courier New', monospace !important;
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        background-color: #0f1419;
+        border-bottom: 1px solid #1e2530;
+        gap: 0px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #0f1419;
+        color: #8b949e;
+        border: 1px solid #1e2530;
+        font-family: 'Consolas', monospace;
+        font-size: 13px;
+        padding: 8px 16px;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #1a1f2e !important;
+        color: #ff9500 !important;
+        border-bottom: 2px solid #ff9500 !important;
+    }
+
+    /* Metrics */
+    [data-testid="stMetric"] {
+        background-color: #111820;
+        border: 1px solid #1e2530;
+        padding: 12px;
+        border-radius: 2px;
+    }
+    [data-testid="stMetricLabel"] {
+        color: #8b949e !important;
+        font-family: 'Consolas', monospace !important;
+        font-size: 11px !important;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    [data-testid="stMetricValue"] {
+        color: #e6edf3 !important;
+        font-family: 'Consolas', monospace !important;
+    }
+    [data-testid="stMetricDelta"] {
+        font-family: 'Consolas', monospace !important;
+    }
+
+    /* Dataframes */
+    .stDataFrame {
+        border: 1px solid #1e2530;
+    }
+
+    /* Markdown text */
+    .stMarkdown p, .stMarkdown li, .stMarkdown span {
+        color: #c8cdd3;
+        font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+        font-size: 13px;
+    }
+
+    /* Captions */
+    .stCaption, [data-testid="stCaptionContainer"] {
+        color: #586069 !important;
+        font-family: 'Consolas', monospace !important;
+    }
+
+    /* Dividers */
+    hr {
+        border-color: #1e2530 !important;
+    }
+
+    /* Power grid custom classes */
+    .power-grid-container {
+        font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+        font-size: 13px;
+        border: 1px solid #1e2530;
+        background-color: #0f1419;
+    }
+    .power-cell-pos {
+        color: #3fb950;
+        font-weight: bold;
+    }
+    .power-cell-neg {
+        color: #f85149;
+        font-weight: bold;
+    }
+    .power-cell-neutral {
+        color: #8b949e;
+    }
+    .bloomberg-header {
+        background-color: #111820;
+        border-bottom: 2px solid #ff9500;
+        padding: 8px 12px;
+        margin-bottom: 4px;
+    }
+    .bloomberg-header span {
+        color: #ff9500 !important;
+        font-family: 'Consolas', monospace !important;
+        font-size: 14px !important;
+        font-weight: bold;
+        letter-spacing: 1px;
+    }
+
+    /* Info/warning/success/error boxes */
+    .stAlert {
+        background-color: #111820;
+        border: 1px solid #1e2530;
+        color: #c8cdd3;
+    }
+
+    /* Inputs */
+    .stNumberInput input, .stSelectbox select, .stTextInput input {
+        background-color: #111820 !important;
+        color: #e6edf3 !important;
+        border-color: #1e2530 !important;
+        font-family: 'Consolas', monospace !important;
+    }
+
+    /* Slider */
+    .stSlider label {
+        color: #8b949e !important;
     }
     </style>
 """, unsafe_allow_html=True)
 
 # Title
-st.title("📊 Volatility Trading Dashboard")
+st.markdown('<div class="bloomberg-header"><span>VOL TRADING DASHBOARD</span></div>', unsafe_allow_html=True)
 
 # Sidebar - Settings
 st.sidebar.header("Settings")
@@ -73,10 +209,21 @@ st.sidebar.header("Settings")
 # Load data
 try:
     df = load_data()
+    master_df = load_master()
     live_vols = load_live_vols()
+
+    # Ensure datetime for date columns
+    for frame in [df, master_df]:
+        if 'date' in frame.columns:
+            frame['date'] = pd.to_datetime(frame['date'], errors='coerce')
+        if 'expiry' in frame.columns:
+            frame['expiry'] = pd.to_datetime(frame['expiry'], errors='coerce')
     
-    latest_date = df['date'].max()
-    earliest_date = df['date'].min()
+    latest_date = pd.to_datetime(df['date']).max()
+    earliest_date = pd.to_datetime(df['date']).min()
+    if pd.isna(latest_date) or pd.isna(earliest_date):
+        st.error("No dates found in data.")
+        st.stop()
     
     # Show live data indicator if available
     if live_vols:
@@ -92,9 +239,9 @@ try:
     # Date selector
     selected_date = st.sidebar.date_input(
         "Analysis Date",
-        value=latest_date,
-        min_value=earliest_date,
-        max_value=latest_date
+        value=latest_date.date(),
+        min_value=earliest_date.date(),
+        max_value=latest_date.date()
     )
     selected_date = pd.to_datetime(selected_date)
     
@@ -122,16 +269,348 @@ except Exception as e:
     st.stop()
 
 # Main content
-st.markdown(f"### {commodity} - {selected_date.date()}")
+st.markdown(f'<div style="font-family:Consolas,monospace;color:#8b949e;font-size:13px;margin:4px 0 8px 0;">{commodity} &nbsp;|&nbsp; {selected_date.strftime("%Y-%m-%d")} &nbsp;|&nbsp; Lookback: {lookback}d</div>', unsafe_allow_html=True)
 
 # Tab layout
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Main Dashboard",
-    "📊 Term Structure",
-    "🔀 Spreads",
-    "📉 Skew Analysis",
-    "📐 Var Ratios"
+tab0, tab_pct, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "POWER GRID",
+    "IV %ILE",
+    "DASHBOARD",
+    "TERM STRUCT",
+    "SPREADS",
+    "SKEW",
+    "VAR RATIOS"
 ])
+
+# ============================================================================
+# TAB 0: POWER GRID
+# ============================================================================
+with tab0:
+    st.markdown('<div class="bloomberg-header"><span>POWER GRID</span></div>', unsafe_allow_html=True)
+    st.caption("(FWD VOL - PREDICTED RV) / FWD VOL  |  Positive = IV rich, Negative = IV cheap")
+
+    grid_commodities = ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT']
+    max_grid_months = 8
+
+    # Load predicted RV from verdad workbook
+    verdad_overall = {}
+    verdad_monthly = {}
+    verdad_loaded = False
+    try:
+        import os
+        if os.path.exists('verdad.7.xlsx'):
+            verdad_overall, verdad_monthly = va.load_verdad_predictions('verdad.7.xlsx')
+            verdad_loaded = True
+    except Exception as e:
+        st.warning(f"Could not load verdad.7.xlsx: {e}")
+
+    if verdad_loaded:
+        st.markdown("""
+        <div style="font-family:Consolas,monospace;font-size:11px;color:#56d364;margin-bottom:6px;">
+            VERDAD MODEL LOADED — per-month predicted RV active
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Show overall levels as reference
+        overall_str = " &nbsp;|&nbsp; ".join(
+            [f'<span style="color:#ff9500;">{c}</span>: {verdad_overall.get(c, 0):.1f}'
+             for c in grid_commodities if c in verdad_overall]
+        )
+        st.markdown(f"""
+        <div style="font-family:Consolas,monospace;font-size:12px;color:#8b949e;margin-bottom:12px;">
+            OVERALL LEVELS: {overall_str}
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("**MODEL INPUTS** — Enter predicted realized vol for each commodity")
+
+    # Fallback manual inputs when verdad is not loaded
+    if not verdad_loaded:
+        default_rvs = {}
+        for c in grid_commodities:
+            m1_data = df[
+                (df['date'] == selected_date) & (df['commodity'] == c) & (df['contract_month'] == 1)
+            ]
+            if len(m1_data) > 0 and pd.notna(m1_data.iloc[0]['fwd_vol']):
+                default_rvs[c] = float(m1_data.iloc[0]['fwd_vol'])
+            else:
+                default_rvs[c] = 15.0
+
+        input_cols = st.columns(len(grid_commodities))
+        manual_rv_inputs = {}
+        for i, c in enumerate(grid_commodities):
+            with input_cols[i]:
+                manual_rv_inputs[c] = st.number_input(
+                    f"{c}", min_value=0.1, max_value=100.0,
+                    value=default_rvs[c], step=0.25, format="%.2f",
+                    key=f"power_rv_{c}"
+                )
+        predicted_rv_overall = manual_rv_inputs
+        predicted_rv_monthly = None
+    else:
+        predicted_rv_overall = verdad_overall
+        predicted_rv_monthly = verdad_monthly
+
+    st.markdown("---")
+
+    # Calculate the power grid
+    power_df, power_meta = va.calculate_power_grid(
+        df, selected_date, predicted_rv_overall,
+        commodities=grid_commodities, max_months=max_grid_months,
+        monthly_predictions=predicted_rv_monthly
+    )
+
+    if len(power_df) > 0:
+        fwd_vols_df = power_meta['fwd_vols']
+        pred_rvs_df = power_meta['pred_rvs']
+        month_codes_df = power_meta.get('month_codes', pd.DataFrame())
+
+        # Build HTML table for Bloomberg-style display
+        def _power_color(val):
+            """Return CSS color for a power value."""
+            if pd.isna(val):
+                return '#586069', ''
+            if val > 5:
+                return '#3fb950', 'font-weight:bold'
+            elif val > 0:
+                return '#56d364', ''
+            elif val > -5:
+                return '#f85149', ''
+            else:
+                return '#ff7b72', 'font-weight:bold'
+
+        # Column headers with month codes if available
+        header_cells = '<th style="color:#8b949e;padding:6px 10px;text-align:left;border-bottom:2px solid #ff9500;border-right:1px solid #1e2530;"></th>'
+        for col in power_df.columns:
+            # Try to get the month code for this column from the first commodity that has it
+            code_label = ''
+            if len(month_codes_df) > 0:
+                for cidx in month_codes_df.index:
+                    if col in month_codes_df.columns:
+                        c_val = month_codes_df.loc[cidx, col]
+                        if pd.notna(c_val) and str(c_val) != '?':
+                            code_label = f'<br/><span style="color:#586069;font-size:10px;">{c_val}</span>'
+                            break
+            header_cells += f'<th style="color:#8b949e;padding:6px 10px;text-align:right;border-bottom:2px solid #ff9500;border-right:1px solid #1e2530;font-size:12px;">{col}{code_label}</th>'
+
+        html_rows = []
+        for commodity in power_df.index:
+            cells = f'<td style="color:#ff9500;font-weight:bold;padding:6px 10px;border-right:1px solid #1e2530;white-space:nowrap;">{commodity}</td>'
+            for col in power_df.columns:
+                val = power_df.loc[commodity, col] if col in power_df.columns else None
+                if pd.notna(val):
+                    color, style = _power_color(val)
+                    # Build tooltip with fwd vol, predicted RV, and month code
+                    fv = fwd_vols_df.loc[commodity, col] if col in fwd_vols_df.columns and pd.notna(fwd_vols_df.loc[commodity, col]) else None
+                    pr = pred_rvs_df.loc[commodity, col] if col in pred_rvs_df.columns and pd.notna(pred_rvs_df.loc[commodity, col]) else None
+                    mc = ''
+                    if len(month_codes_df) > 0 and col in month_codes_df.columns:
+                        mc_val = month_codes_df.loc[commodity, col] if commodity in month_codes_df.index else None
+                        mc = f" [{mc_val}]" if pd.notna(mc_val) else ""
+                    tip_parts = []
+                    if fv is not None:
+                        tip_parts.append(f"FV:{fv:.1f}")
+                    if pr is not None:
+                        tip_parts.append(f"RV:{pr:.1f}")
+                    tip_parts.append(mc.strip())
+                    tooltip = " | ".join([t for t in tip_parts if t])
+                    cells += f'<td style="color:{color};{style};padding:6px 10px;text-align:right;border-right:1px solid #1e2530;" title="{tooltip}">{val:+.1f}%</td>'
+                else:
+                    cells += f'<td style="color:#586069;padding:6px 10px;text-align:center;border-right:1px solid #1e2530;">—</td>'
+            html_rows.append(f'<tr style="border-bottom:1px solid #1e2530;">{cells}</tr>')
+
+        html_table = f"""
+        <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-family:Consolas,Monaco,monospace;font-size:14px;background-color:#0f1419;border:1px solid #1e2530;">
+            <thead><tr>{header_cells}</tr></thead>
+            <tbody>{''.join(html_rows)}</tbody>
+        </table>
+        </div>
+        """
+        st.markdown(html_table, unsafe_allow_html=True)
+
+        st.markdown("")  # spacer
+
+        # Expandable reference tables
+        col_ref1, col_ref2 = st.columns(2)
+
+        with col_ref1:
+            with st.expander("FWD VOL MATRIX"):
+                if len(fwd_vols_df) > 0:
+                    fwd_html_rows = []
+                    for commodity in fwd_vols_df.index:
+                        cells = f'<td style="color:#ff9500;font-weight:bold;padding:4px 8px;border-right:1px solid #1e2530;">{commodity}</td>'
+                        for col in fwd_vols_df.columns:
+                            val = fwd_vols_df.loc[commodity, col] if col in fwd_vols_df.columns else None
+                            if pd.notna(val):
+                                cells += f'<td style="color:#c8cdd3;padding:4px 8px;text-align:right;border-right:1px solid #1e2530;">{val:.2f}</td>'
+                            else:
+                                cells += f'<td style="color:#586069;padding:4px 8px;text-align:center;border-right:1px solid #1e2530;">—</td>'
+                        fwd_html_rows.append(f'<tr style="border-bottom:1px solid #1e2530;">{cells}</tr>')
+                    fwd_header = '<th style="color:#8b949e;padding:4px 8px;border-bottom:1px solid #ff9500;border-right:1px solid #1e2530;"></th>'
+                    for col in fwd_vols_df.columns:
+                        fwd_header += f'<th style="color:#8b949e;padding:4px 8px;text-align:right;border-bottom:1px solid #ff9500;border-right:1px solid #1e2530;font-size:11px;">{col}</th>'
+                    st.markdown(f"""
+                    <table style="width:100%;border-collapse:collapse;font-family:Consolas,Monaco,monospace;font-size:13px;background-color:#0f1419;border:1px solid #1e2530;">
+                        <thead><tr>{fwd_header}</tr></thead>
+                        <tbody>{''.join(fwd_html_rows)}</tbody>
+                    </table>
+                    """, unsafe_allow_html=True)
+
+        with col_ref2:
+            with st.expander("PREDICTED RV MATRIX"):
+                if len(pred_rvs_df) > 0:
+                    rv_html_rows = []
+                    for commodity in pred_rvs_df.index:
+                        cells = f'<td style="color:#ff9500;font-weight:bold;padding:4px 8px;border-right:1px solid #1e2530;">{commodity}</td>'
+                        for col in pred_rvs_df.columns:
+                            val = pred_rvs_df.loc[commodity, col] if col in pred_rvs_df.columns else None
+                            if pd.notna(val):
+                                cells += f'<td style="color:#c8cdd3;padding:4px 8px;text-align:right;border-right:1px solid #1e2530;">{val:.2f}</td>'
+                            else:
+                                cells += f'<td style="color:#586069;padding:4px 8px;text-align:center;border-right:1px solid #1e2530;">—</td>'
+                        rv_html_rows.append(f'<tr style="border-bottom:1px solid #1e2530;">{cells}</tr>')
+                    rv_header = '<th style="color:#8b949e;padding:4px 8px;border-bottom:1px solid #ff9500;border-right:1px solid #1e2530;"></th>'
+                    for col in pred_rvs_df.columns:
+                        rv_header += f'<th style="color:#8b949e;padding:4px 8px;text-align:right;border-bottom:1px solid #ff9500;border-right:1px solid #1e2530;font-size:11px;">{col}</th>'
+                    st.markdown(f"""
+                    <table style="width:100%;border-collapse:collapse;font-family:Consolas,Monaco,monospace;font-size:13px;background-color:#0f1419;border:1px solid #1e2530;">
+                        <thead><tr>{rv_header}</tr></thead>
+                        <tbody>{''.join(rv_html_rows)}</tbody>
+                    </table>
+                    """, unsafe_allow_html=True)
+
+        # Legend
+        st.markdown("""
+        <div style="font-family:Consolas,monospace;font-size:11px;color:#586069;margin-top:8px;">
+            <span style="color:#3fb950;">&#9632;</span> &gt;+5% IV RICH &nbsp;&nbsp;
+            <span style="color:#56d364;">&#9632;</span> 0 to +5% &nbsp;&nbsp;
+            <span style="color:#f85149;">&#9632;</span> 0 to -5% &nbsp;&nbsp;
+            <span style="color:#ff7b72;">&#9632;</span> &lt;-5% IV CHEAP &nbsp;&nbsp;
+            | Hover cells for FV:fwd_vol | RV:pred_rv | [month_code]
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.warning(f"No forward vol data available for {selected_date.date()}")
+
+# ============================================================================
+# TAB: IV PERCENTILE BATTERY
+# ============================================================================
+with tab_pct:
+    st.markdown('<div class="bloomberg-header"><span>IV PERCENTILE RANK</span></div>', unsafe_allow_html=True)
+
+    pct_commodities = ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT']
+    pct_max_months = 8
+
+    # Calculate all percentiles in one shot (dirty vol only)
+    master_hist = master_df[master_df['date'] < selected_date].copy()
+
+    pct_grid = va.calculate_percentile_grid(
+        df, selected_date, metric='dirty_vol',
+        lookback_days=lookback, commodities=pct_commodities,
+        max_months=pct_max_months, hist_df=master_hist
+    )
+
+    if len(pct_grid) > 0:
+        # Build the battery bar HTML for each commodity
+        for commodity in pct_commodities:
+            cdata = pct_grid[pct_grid['commodity'] == commodity].sort_values('contract_month')
+            if len(cdata) == 0:
+                continue
+
+            # Commodity header
+            bars_html = textwrap.dedent(f"""
+            <div style="margin-bottom:16px;">
+                <div style="font-family:Consolas,monospace;font-size:13px;color:#ff9500;font-weight:bold;margin-bottom:6px;">
+                    {commodity}
+                </div>
+            """)
+
+            for _, row in cdata.iterrows():
+                cm = int(row['contract_month'])
+                pct = row['percentile']
+                current = row['current']
+                median = row['median']
+
+                # Color based on percentile level
+                if pct >= 80:
+                    fill_color = '#f85149'     # red - very high
+                    text_color = '#f85149'
+                elif pct >= 60:
+                    fill_color = '#d29922'     # amber - high
+                    text_color = '#d29922'
+                elif pct <= 20:
+                    fill_color = '#3fb950'     # green - very low
+                    text_color = '#3fb950'
+                elif pct <= 40:
+                    fill_color = '#56d364'     # light green - low
+                    text_color = '#56d364'
+                else:
+                    fill_color = '#8b949e'     # gray - neutral
+                    text_color = '#8b949e'
+
+                # Clamp width to 0-100
+                bar_width = max(0, min(100, pct))
+
+                bars_html += textwrap.dedent(f"""
+                <div style="display:flex;align-items:center;margin-bottom:3px;font-family:Consolas,monospace;">
+                    <div style="width:28px;font-size:11px;color:#8b949e;text-align:right;margin-right:8px;">M{cm}</div>
+                    <div style="flex:1;max-width:400px;position:relative;">
+                        <div style="background-color:#1e2530;border:1px solid #2d333b;height:18px;border-radius:2px;overflow:hidden;">
+                            <div style="background-color:{fill_color};width:{bar_width}%;height:100%;border-radius:1px;transition:width 0.3s;"></div>
+                        </div>
+                    </div>
+                    <div style="width:48px;font-size:12px;color:{text_color};text-align:right;margin-left:8px;font-weight:bold;">{pct:.0f}%</div>
+                    <div style="width:80px;font-size:11px;color:#586069;text-align:right;margin-left:8px;">{current:.1f}</div>
+                    <div style="width:70px;font-size:10px;color:#3d444d;text-align:right;margin-left:4px;">med {median:.1f}</div>
+                </div>
+                """)
+
+            bars_html += "</div>"
+            st.markdown(bars_html, unsafe_allow_html=True)
+
+        # Legend
+        st.markdown(textwrap.dedent("""
+        <div style="font-family:Consolas,monospace;font-size:11px;color:#586069;margin-top:12px;border-top:1px solid #1e2530;padding-top:8px;">
+            <span style="color:#f85149;">&#9632;</span> &gt;80th EXPENSIVE &nbsp;&nbsp;
+            <span style="color:#d29922;">&#9632;</span> 60-80th HIGH &nbsp;&nbsp;
+            <span style="color:#8b949e;">&#9632;</span> 40-60th NEUTRAL &nbsp;&nbsp;
+            <span style="color:#56d364;">&#9632;</span> 20-40th LOW &nbsp;&nbsp;
+            <span style="color:#3fb950;">&#9632;</span> &lt;20th CHEAP &nbsp;&nbsp;
+            | Values = current vol | med = median
+        </div>
+        """), unsafe_allow_html=True)
+
+    else:
+        st.warning(f"No percentile data available for {selected_date.date()}")
+
+    # Debug panel: show current vols as read from CSV for the selected commodity/date
+    with st.expander("Data Debug – current vols (from CSV)"):
+        current_rows = df[
+            (df['date'] == selected_date) &
+            (df['commodity'] == commodity)
+        ].sort_values('contract_month')[
+            ['contract_month', 'dirty_vol', 'clean_vol', 'fwd_vol', 'expiry']
+        ]
+        if len(current_rows) == 0:
+            st.write("No rows found for this date/commodity.")
+        else:
+            st.caption(f"Source date: {selected_date.date()} | Commodity: {commodity}")
+            st.dataframe(
+                current_rows.rename(columns={
+                    'contract_month': 'CM',
+                    'dirty_vol': 'Dirty Vol',
+                    'clean_vol': 'Clean Vol',
+                    'fwd_vol': 'Fwd Vol',
+                    'expiry': 'Expiry'
+                }).style.format({
+                    'Dirty Vol': '{:.3f}',
+                    'Clean Vol': '{:.3f}',
+                    'Fwd Vol': '{:.3f}'
+                }),
+                use_container_width=True,
+                height=240
+            )
 
 # ============================================================================
 # TAB 1: MAIN DASHBOARD
@@ -146,12 +625,12 @@ with tab1:
     # Get front month stats
     front_vol_stats = va.calculate_percentile_rank(
         df, selected_date, 1, 'clean_vol', 
-        lookback_days=lookback, commodity=commodity
+        lookback_days=lookback, commodity=commodity, hist_df=master_hist
     )
     
     fwd_vol_stats = va.calculate_percentile_rank(
         df, selected_date, 1, 'fwd_vol',
-        lookback_days=lookback, commodity=commodity
+        lookback_days=lookback, commodity=commodity, hist_df=master_hist
     )
     
     if front_vol_stats and fwd_vol_stats:
@@ -333,7 +812,7 @@ with tab3:
     with col1:
         # M1-M2
         spread_12 = va.calculate_calendar_spread(
-            df, selected_date, 1, 2, 'fwd_vol', commodity=commodity
+            df, selected_date, 1, 2, 'fwd_vol', commodity=commodity, hist_df=master_hist
         )
         if spread_12:
             st.metric(
@@ -345,7 +824,7 @@ with tab3:
         
         # M2-M3
         spread_23 = va.calculate_calendar_spread(
-            df, selected_date, 2, 3, 'fwd_vol', commodity=commodity
+            df, selected_date, 2, 3, 'fwd_vol', commodity=commodity, hist_df=master_hist
         )
         if spread_23:
             st.metric(
@@ -358,7 +837,7 @@ with tab3:
     with col2:
         # M3-M4
         spread_34 = va.calculate_calendar_spread(
-            df, selected_date, 3, 4, 'fwd_vol', commodity=commodity
+            df, selected_date, 3, 4, 'fwd_vol', commodity=commodity, hist_df=master_hist
         )
         if spread_34:
             st.metric(
@@ -378,7 +857,7 @@ with tab3:
     with col1:
         # SOY vs MEAL
         soy_meal = va.calculate_cross_commodity_spread(
-            df, selected_date, 'SOY', 'MEAL', 1, 'clean_vol'
+            df, selected_date, 'SOY', 'MEAL', 1, 'clean_vol', hist_df=master_hist
         )
         if soy_meal:
             st.markdown("**SOY vs MEAL (M1 Clean Vol)**")
@@ -393,7 +872,7 @@ with tab3:
     with col2:
         # CORN vs WHEAT
         corn_wheat = va.calculate_cross_commodity_spread(
-            df, selected_date, 'CORN', 'WHEAT', 1, 'clean_vol'
+            df, selected_date, 'CORN', 'WHEAT', 1, 'clean_vol', hist_df=master_hist
         )
         if corn_wheat:
             st.markdown("**CORN vs WHEAT (M1 Clean Vol)**")
@@ -411,7 +890,7 @@ with tab3:
 with tab4:
     st.subheader("Skew Analysis vs Historical")
     
-    skew_summary = va.get_skew_summary(df, selected_date, 1, commodity=commodity)
+    skew_summary = va.get_skew_summary(df, selected_date, 1, commodity=commodity, hist_df=master_hist)
     
     if len(skew_summary) > 0:
         # Display as table
@@ -489,7 +968,7 @@ with tab5:
             )
 
             # Map options month to futures month for display
-            futures_month = vr.OPTIONS_TO_FUTURES.get(front_month, front_month)
+            futures_month = vr.options_to_futures(front_month, commodity)
             st.caption(f"Underlying futures: {futures_month}")
 
         with col2:
@@ -557,4 +1036,4 @@ with tab5:
 
 # Footer
 st.markdown("---")
-st.caption("Vol Trading Dashboard | Data updated daily")
+st.markdown('<div style="font-family:Consolas,monospace;font-size:10px;color:#586069;text-align:right;">VOL TRADING DASHBOARD &nbsp;|&nbsp; DATA UPDATED DAILY</div>', unsafe_allow_html=True)

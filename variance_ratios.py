@@ -10,6 +10,8 @@ Used for relative value analysis across the futures curve.
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import functools
+import os
 
 
 # Futures month codes in calendar order
@@ -18,21 +20,37 @@ MONTH_CODES = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
 # Soybean futures months (F, H, K, N, Q, U, X)
 SOY_MONTHS = ['F', 'H', 'K', 'N', 'Q', 'U', 'X']
 
-# Options to futures mapping
-# Key = options month, Value = underlying futures month
-OPTIONS_TO_FUTURES = {
-    'H': 'H',  # March options -> March futures
-    'J': 'K',  # April options -> May futures
-    'K': 'K',  # May options -> May futures
-    'M': 'N',  # June options -> July futures
-    'N': 'N',  # July options -> July futures
-    'Q': 'Q',  # August options -> August futures
-    'U': 'U',  # September options -> September futures
-    'V': 'X',  # October options -> November futures
-    'X': 'X',  # November options -> November futures
-    'Z': 'F',  # December options -> January futures (next year)
-    'F': 'F',  # January options -> January futures
-}
+@functools.lru_cache(maxsize=1)
+def load_month_mapping(path: str = 'mapping.csv') -> pd.DataFrame:
+    """Load the options->futures mapping per commodity."""
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=['OPTIONS', 'FUTURES', 'COMMODITY', 'EXPIRY_MONTH'])
+    df = pd.read_csv(path)
+    df['OPTIONS'] = df['OPTIONS'].astype(str).str.upper()
+    df['FUTURES'] = df['FUTURES'].astype(str).str.upper()
+    df['COMMODITY'] = df['COMMODITY'].astype(str).str.upper()
+    return df
+
+
+def options_to_futures(option_code: str, commodity: str, mapping_path: str = 'mapping.csv') -> str:
+    mapping = load_month_mapping(mapping_path)
+    subset = mapping[(mapping['OPTIONS'] == option_code.upper()) & (mapping['COMMODITY'] == commodity.upper())]
+    if len(subset) == 0:
+        return option_code.upper()  # fallback: same code
+    return subset.iloc[0]['FUTURES']
+
+
+def futures_month_sequence(commodity: str, mapping_path: str = 'mapping.csv') -> list:
+    """
+    Return ordered futures month codes for a commodity based on mapping expiry order.
+    """
+    mapping = load_month_mapping(mapping_path)
+    subset = mapping[mapping['COMMODITY'] == commodity.upper()].copy()
+    if 'EXPIRY_MONTH' in subset.columns:
+        subset = subset.sort_values('EXPIRY_MONTH')
+    months = subset['FUTURES'].unique().tolist()
+    # Fallback to full list if empty
+    return months if months else MONTH_CODES
 
 
 def get_futures_curve_for_front_month(front_month: str, commodity: str = 'SOY') -> list:
@@ -46,11 +64,7 @@ def get_futures_curve_for_front_month(front_month: str, commodity: str = 'SOY') 
     Returns:
         List of month codes in curve order starting from front month
     """
-    if commodity == 'SOY':
-        months = SOY_MONTHS
-    else:
-        # For other commodities, use all months for now
-        months = MONTH_CODES
+    months = futures_month_sequence(commodity)
 
     # Find starting position
     if front_month not in months:
@@ -125,8 +139,8 @@ def identify_front_month_periods(prices_df: pd.DataFrame,
     Returns:
         DataFrame with date ranges and year for each front month period
     """
-    # Get the underlying futures month
-    front_futures_month = OPTIONS_TO_FUTURES.get(front_options_month, front_options_month)
+    # Get the underlying futures month from mapping
+    front_futures_month = options_to_futures(front_options_month, commodity)
 
     # Filter to commodity
     df = prices_df[prices_df['commodity'] == commodity].copy()
@@ -185,6 +199,26 @@ def identify_front_month_periods(prices_df: pd.DataFrame,
             })
 
     return pd.DataFrame(periods)
+
+
+@functools.lru_cache(maxsize=32)
+def _load_prices(path: str = 'all_commodity_prices.csv') -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df['date'] = pd.to_datetime(df['date'], format='mixed')
+    return df
+
+
+@functools.lru_cache(maxsize=64)
+def _filtered_prices(path: str, commodity: str) -> pd.DataFrame:
+    prices = _load_prices(path)
+    return prices[prices['commodity'] == commodity].copy()
+
+
+@functools.lru_cache(maxsize=128)
+def _cached_daily_returns(path: str, commodity: str) -> pd.DataFrame:
+    prices_df = _filtered_prices(path, commodity)
+    returns_df = calculate_daily_returns(prices_df, commodity)
+    return returns_df
 
 
 def calculate_daily_returns(prices_df: pd.DataFrame, commodity: str = 'SOY') -> pd.DataFrame:
@@ -268,8 +302,8 @@ def build_variance_ratio_matrix(prices_df: pd.DataFrame,
     Returns:
         DataFrame with variance ratio matrix
     """
-    # Get the futures curve order
-    front_futures_month = OPTIONS_TO_FUTURES.get(front_options_month, front_options_month)
+    # Get the futures curve order using mapping
+    front_futures_month = options_to_futures(front_options_month, commodity)
     curve = get_futures_curve_for_front_month(front_futures_month, commodity)[:num_contracts]
 
     # Identify historical front month periods
@@ -284,8 +318,8 @@ def build_variance_ratio_matrix(prices_df: pd.DataFrame,
         # Keep only the most recent N years
         periods = periods.sort_values('year', ascending=False).head(lookback_years)
 
-    # Calculate returns
-    returns_df = calculate_daily_returns(prices_df, commodity)
+    # Calculate returns (cached)
+    returns_df = _cached_daily_returns('all_commodity_prices.csv', commodity)
 
     # For each historical period, calculate variance for each contract on the curve
     all_variances = []
@@ -320,6 +354,24 @@ def build_variance_ratio_matrix(prices_df: pd.DataFrame,
         all_variances.append(period_variances)
 
     variances_df = pd.DataFrame(all_variances)
+
+    # Reduce to positions that actually have variance data (avoid empty/missing months)
+    valid_positions = [p for p in range(num_contracts) if variances_df.get(f'{p+1}FM', pd.Series(dtype=float)).notna().any()]
+    if len(valid_positions) == 0:
+        return pd.DataFrame()
+
+    # Remap curve and variances_df to only valid positions
+    curve = [curve[p] for p in valid_positions]
+    num_contracts = len(valid_positions)
+
+    def remap_row(row):
+        new_row = {'period': row['period']}
+        for new_idx, old_pos in enumerate(valid_positions):
+            new_row[f'{new_idx+1}FM'] = row.get(f'{old_pos+1}FM', np.nan)
+            new_row[f'{new_idx+1}FM_code'] = row.get(f'{old_pos+1}FM_code', None)
+        return new_row
+
+    variances_df = pd.DataFrame([remap_row(r) for _, r in variances_df.iterrows()])
 
     # Calculate variance ratios for each period, then average the ratios
     # This is more accurate than averaging variances then computing ratio
@@ -414,6 +466,39 @@ def build_variance_ratio_matrix(prices_df: pd.DataFrame,
     return result_df
 
 
+@functools.lru_cache(maxsize=64)
+def _cached_variance_ratio_display(front_options_month: str,
+                                   commodity: str = 'SOY',
+                                   lookback_years: int = None,
+                                   num_contracts: int = 12,
+                                   prices_path: str = 'all_commodity_prices.csv') -> tuple:
+    prices_df = _filtered_prices(prices_path, commodity)
+    matrix = build_variance_ratio_matrix(
+        prices_df, front_options_month, commodity,
+        num_contracts=num_contracts,
+        lookback_years=lookback_years
+    )
+    if len(matrix) == 0:
+        return pd.DataFrame(), {}
+
+    display_df = matrix.round(2)
+
+    periods = identify_front_month_periods(prices_df, front_options_month, commodity)
+    if lookback_years is not None and lookback_years > 0:
+        periods = periods.sort_values('year', ascending=False).head(lookback_years)
+
+    metadata = {
+        'front_options_month': front_options_month,
+        'front_futures_month': OPTIONS_TO_FUTURES.get(front_options_month, front_options_month),
+        'commodity': commodity,
+        'num_historical_periods': len(periods),
+        'years_included': sorted(periods['year'].unique().tolist()) if len(periods) > 0 else [],
+        'total_trading_days': periods['trading_days'].sum() if len(periods) > 0 else 0
+    }
+
+    return display_df, metadata
+
+
 def get_variance_ratio_display(prices_df: pd.DataFrame,
                                 front_options_month: str,
                                 commodity: str = 'SOY',
@@ -430,32 +515,8 @@ def get_variance_ratio_display(prices_df: pd.DataFrame,
     Returns:
         Tuple of (matrix_df, metadata_dict)
     """
-    matrix = build_variance_ratio_matrix(
-        prices_df, front_options_month, commodity,
-        lookback_years=lookback_years
-    )
-
-    if len(matrix) == 0:
-        return pd.DataFrame(), {}
-
-    # Round for display
-    display_df = matrix.round(2)
-
-    # Metadata - get periods with same lookback filter applied
-    periods = identify_front_month_periods(prices_df, front_options_month, commodity)
-    if lookback_years is not None and lookback_years > 0:
-        periods = periods.sort_values('year', ascending=False).head(lookback_years)
-
-    metadata = {
-        'front_options_month': front_options_month,
-        'front_futures_month': OPTIONS_TO_FUTURES.get(front_options_month, front_options_month),
-        'commodity': commodity,
-        'num_historical_periods': len(periods),
-        'years_included': sorted(periods['year'].unique().tolist()) if len(periods) > 0 else [],
-        'total_trading_days': periods['trading_days'].sum() if len(periods) > 0 else 0
-    }
-
-    return display_df, metadata
+    # Use cached builder ignoring incoming prices_df to avoid recompute on rerun
+    return _cached_variance_ratio_display(front_options_month, commodity, lookback_years)
 
 
 # Test function
