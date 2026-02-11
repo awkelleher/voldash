@@ -10,7 +10,7 @@ import numpy as np
 from datetime import datetime, timedelta
 
 
-def load_price_data(filepath='all_commodity_prices.csv'):
+def load_price_data(filepath='data/all_commodity_prices.csv'):
     """Load historical price data"""
     df = pd.read_csv(filepath, parse_dates=['date'])
     df = df.sort_values(['commodity', 'contract_code', 'date'])
@@ -268,8 +268,8 @@ if __name__ == "__main__":
     print(f"\n✓ Calculated realized vol for {len(all_rv):,} observations")
     
     # Save results
-    all_rv.to_csv('continuous_prices_with_rv.csv', index=False)
-    print(f"✓ Saved to continuous_prices_with_rv.csv")
+    all_rv.to_csv('data/continuous_prices_with_rv.csv', index=False)
+    print(f"✓ Saved to data/continuous_prices_with_rv.csv")
     
     # Show latest values
     print("\n" + "="*70)

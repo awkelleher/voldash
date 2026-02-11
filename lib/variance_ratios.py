@@ -24,7 +24,7 @@ CACHE_DIR = Path("cache/variance_ratios")
 SOY_MONTHS = ['F', 'H', 'K', 'N', 'Q', 'U', 'X']
 
 @functools.lru_cache(maxsize=1)
-def load_month_mapping(path: str = 'mapping.csv') -> pd.DataFrame:
+def load_month_mapping(path: str = 'data/mapping.csv') -> pd.DataFrame:
     """Load the options->futures mapping per commodity."""
     if not os.path.exists(path):
         return pd.DataFrame(columns=['OPTIONS', 'FUTURES', 'COMMODITY', 'EXPIRY_MONTH'])
@@ -35,7 +35,7 @@ def load_month_mapping(path: str = 'mapping.csv') -> pd.DataFrame:
     return df
 
 
-def options_to_futures(option_code: str, commodity: str, mapping_path: str = 'mapping.csv') -> str:
+def options_to_futures(option_code: str, commodity: str, mapping_path: str = 'data/mapping.csv') -> str:
     mapping = load_month_mapping(mapping_path)
     subset = mapping[(mapping['OPTIONS'] == option_code.upper()) & (mapping['COMMODITY'] == commodity.upper())]
     if len(subset) == 0:
@@ -43,7 +43,7 @@ def options_to_futures(option_code: str, commodity: str, mapping_path: str = 'ma
     return subset.iloc[0]['FUTURES']
 
 
-def futures_month_sequence(commodity: str, mapping_path: str = 'mapping.csv') -> list:
+def futures_month_sequence(commodity: str, mapping_path: str = 'data/mapping.csv') -> list:
     """
     Return ordered futures month codes for a commodity based on mapping expiry order.
     """
@@ -233,7 +233,7 @@ def identify_front_month_periods(prices_df: pd.DataFrame,
 
 
 @functools.lru_cache(maxsize=32)
-def _load_prices(path: str = 'all_commodity_prices.csv') -> pd.DataFrame:
+def _load_prices(path: str = 'data/all_commodity_prices.csv') -> pd.DataFrame:
     df = pd.read_csv(path)
     df['date'] = pd.to_datetime(df['date'], format='mixed')
     return df
@@ -350,7 +350,7 @@ def build_variance_ratio_matrix(prices_df: pd.DataFrame,
         periods = periods.sort_values('year', ascending=False).head(lookback_years)
 
     # Calculate returns (cached)
-    returns_df = _cached_daily_returns('all_commodity_prices.csv', commodity)
+    returns_df = _cached_daily_returns('data/all_commodity_prices.csv', commodity)
 
     # For each historical period, calculate variance for each contract on the curve
     all_variances = []
@@ -502,7 +502,7 @@ def _cached_variance_ratio_display(front_options_month: str,
                                    commodity: str = 'SOY',
                                    lookback_years: int = None,
                                    num_contracts: int = 12,
-                                   prices_path: str = 'all_commodity_prices.csv') -> tuple:
+                                   prices_path: str = 'data/all_commodity_prices.csv') -> tuple:
     prices_df = _filtered_prices(prices_path, commodity)
     matrix = build_variance_ratio_matrix(
         prices_df, front_options_month, commodity,
@@ -567,7 +567,7 @@ if __name__ == "__main__":
 
     # Load price data
     try:
-        prices = pd.read_csv('all_commodity_prices.csv')
+        prices = pd.read_csv('data/all_commodity_prices.csv')
         prices['date'] = pd.to_datetime(prices['date'], format='mixed')
         print(f"Loaded {len(prices):,} price records")
         print(f"Date range: {prices['date'].min().date()} to {prices['date'].max().date()}")

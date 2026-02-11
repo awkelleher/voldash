@@ -36,8 +36,8 @@ from pathlib import Path
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 CACHE_DIR = Path("cache/iv_percentiles")
-VOL_SKEW_PATH = r"C:\Users\AdamKelleher\ags_book_streamlit\master_vol_skew.csv"
-MAPPING_PATH = "mapping.csv"
+VOL_SKEW_PATH = r"C:\Users\AdamKelleher\ags_book_streamlit\data\master_vol_skew.csv"
+MAPPING_PATH = "data/mapping.csv"
 
 MONTH_CODES = ["F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X", "Z"]
 

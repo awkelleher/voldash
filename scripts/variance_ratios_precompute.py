@@ -20,7 +20,7 @@ import json
 import argparse
 from datetime import datetime
 from pathlib import Path
-from variance_ratios import (
+from lib.variance_ratios import (
     build_variance_ratio_matrix,
     identify_front_month_periods,
     options_to_futures,
@@ -30,8 +30,8 @@ from variance_ratios import (
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 CACHE_DIR = Path("cache/variance_ratios")
-PRICES_PATH = "all_commodity_prices.csv"
-MAPPING_PATH = "mapping.csv"
+PRICES_PATH = "data/all_commodity_prices.csv"
+MAPPING_PATH = "data/mapping.csv"
 
 # All commodities and their options months to pre-compute
 COMMODITIES = {

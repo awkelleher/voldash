@@ -1,0 +1,17 @@
+# Data files (too large for git)
+*.csv
+*.xlsx
+*.xlsm
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/

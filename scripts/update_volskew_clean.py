@@ -15,19 +15,20 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_OUTPUT = os.path.join(SCRIPT_DIR, 'master_vol_skew.csv')
-LOG_FILE = os.path.join(SCRIPT_DIR, 'vol_parser.log')
+DEFAULT_OUTPUT = os.path.join(PROJECT_DIR, 'data', 'master_vol_skew.csv')
+LOG_FILE = os.path.join(PROJECT_DIR, 'logs', 'vol_parser.log')
 
 EXCEL_EPOCH = datetime(1899, 12, 30)
 
 COMMODITY_BLOCKS = {
-    'SOY':   {'row_num': 1,   'expiry': 2,   'dirty_vol': 4,   'skew_m1_5': 11,  'skew_m0_5': 12,  'skew_p0_5': 13,  'skew_p1_5': 14,  'skew_p3': 15,  'trading_dte': 16},
-    'MEAL':  {'row_num': 19,  'expiry': 20,  'dirty_vol': 22,  'skew_m1_5': 29,  'skew_m0_5': 30,  'skew_p0_5': 31,  'skew_p1_5': 32,  'skew_p3': 33,  'trading_dte': 34},
-    'OIL':   {'row_num': 37,  'expiry': 38,  'dirty_vol': 40,  'skew_m1_5': 47,  'skew_m0_5': 48,  'skew_p0_5': 49,  'skew_p1_5': 50,  'skew_p3': 51,  'trading_dte': 52},
-    'CORN':  {'row_num': 55,  'expiry': 56,  'dirty_vol': 58,  'skew_m1_5': 65,  'skew_m0_5': 66,  'skew_p0_5': 67,  'skew_p1_5': 68,  'skew_p3': 69,  'trading_dte': 70},
-    'WHEAT': {'row_num': 83,  'expiry': 84,  'dirty_vol': 86,  'skew_m1_5': 93,  'skew_m0_5': 94,  'skew_p0_5': 95,  'skew_p1_5': 96,  'skew_p3': 97,  'trading_dte': 98},
-    'KW':    {'row_num': 101, 'expiry': 102, 'dirty_vol': 104, 'skew_m1_5': 111, 'skew_m0_5': 112, 'skew_p0_5': 113, 'skew_p1_5': 114, 'skew_p3': 115, 'trading_dte': 116},
+    'SOY':   {'row_num': 1,   'expiry': 2,   'dirty_vol': 4,   'fwd_vol': 6,   'skew_m1_5': 11,  'skew_m0_5': 12,  'skew_p0_5': 13,  'skew_p1_5': 14,  'skew_p3': 15,  'trading_dte': 16},
+    'MEAL':  {'row_num': 19,  'expiry': 20,  'dirty_vol': 22,  'fwd_vol': 24,  'skew_m1_5': 29,  'skew_m0_5': 30,  'skew_p0_5': 31,  'skew_p1_5': 32,  'skew_p3': 33,  'trading_dte': 34},
+    'OIL':   {'row_num': 37,  'expiry': 38,  'dirty_vol': 40,  'fwd_vol': 42,  'skew_m1_5': 47,  'skew_m0_5': 48,  'skew_p0_5': 49,  'skew_p1_5': 50,  'skew_p3': 51,  'trading_dte': 52},
+    'CORN':  {'row_num': 55,  'expiry': 56,  'dirty_vol': 58,  'fwd_vol': 60,  'skew_m1_5': 65,  'skew_m0_5': 66,  'skew_p0_5': 67,  'skew_p1_5': 68,  'skew_p3': 69,  'trading_dte': 70},
+    'WHEAT': {'row_num': 83,  'expiry': 84,  'dirty_vol': 86,  'fwd_vol': 88,  'skew_m1_5': 93,  'skew_m0_5': 94,  'skew_p0_5': 95,  'skew_p1_5': 96,  'skew_p3': 97,  'trading_dte': 98},
+    'KW':    {'row_num': 101, 'expiry': 102, 'dirty_vol': 104, 'fwd_vol': 106, 'skew_m1_5': 111, 'skew_m0_5': 112, 'skew_p0_5': 113, 'skew_p1_5': 114, 'skew_p3': 115, 'trading_dte': 116},
 }
 
 
@@ -44,12 +45,24 @@ def setup_logging():
 
 
 def serial_to_date(serial):
+    if serial is None:
+        return None
+    serial = str(serial).strip()
+    if not serial:
+        return None
+    # Try Excel serial number first
     try:
         s = int(float(serial))
         if 30000 < s < 60000:
             return (EXCEL_EPOCH + timedelta(days=s)).strftime('%Y-%m-%d')
     except (ValueError, TypeError):
         pass
+    # Try common date formats (M/D/YYYY, YYYY-MM-DD)
+    for fmt in ('%m/%d/%Y', '%Y-%m-%d', '%m/%d/%y'):
+        try:
+            return datetime.strptime(serial, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
     return None
 
 
@@ -105,6 +118,7 @@ def parse_csv_file(filepath):
                         'commodity': commodity,
                         'expiry': expiry,
                         'dirty_vol': round(dirty_vol, 4),
+                        'fwd_vol': parse_float(row[cols['fwd_vol']] if cols['fwd_vol'] < len(row) else ''),
                         'skew_m1.5': parse_float(row[cols['skew_m1_5']] if cols['skew_m1_5'] < len(row) else ''),
                         'skew_m0.5': parse_float(row[cols['skew_m0_5']] if cols['skew_m0_5'] < len(row) else ''),
                         'skew_p0.5': parse_float(row[cols['skew_p0_5']] if cols['skew_p0_5'] < len(row) else ''),
@@ -124,11 +138,11 @@ def main():
 
     # Accept input file as positional arg (matches bat: python update_volskew_clean.py eod_vol_snap.csv)
     if len(sys.argv) < 2:
-        input_file = os.path.join(SCRIPT_DIR, 'eod_vol_snap.csv')
+        input_file = os.path.join(PROJECT_DIR, 'data', 'eod_vol_snap.csv')
     else:
         input_file = sys.argv[1]
         if not os.path.isabs(input_file):
-            input_file = os.path.join(SCRIPT_DIR, input_file)
+            input_file = os.path.join(PROJECT_DIR, 'data', input_file)
 
     output_file = DEFAULT_OUTPUT
 

@@ -1,17 +1,13 @@
-# Data files (too large for git)
-*.csv
-*.xlsx
-*.xlsm
-
-# Python
 __pycache__/
 *.pyc
-.venv/
-venv/
 
-# IDE
-.vscode/
-.idea/
+.claude/
+cache/
+logs/
 
-# Streamlit
-.streamlit/
+data/*.csv
+data/*.xlsm
+!data/mapping.csv
+
+lib/__pycache__/
+scripts/__pycache__/

@@ -118,7 +118,7 @@ def update_prices(new_data_folder):
     print(f"\nNew data: {len(new_combined):,} records")
     
     # Load existing data
-    historical_file = 'all_commodity_prices.csv'
+    historical_file = 'data/all_commodity_prices.csv'
     
     if os.path.exists(historical_file):
         print(f"\nLoading existing data from {historical_file}...")

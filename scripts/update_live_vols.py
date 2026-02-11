@@ -38,10 +38,10 @@ def update_live_vols():
     
     if len(live_data['vols']) > 0:
         # Save to JSON file
-        with open('live_vols.json', 'w') as f:
+        with open('data/live_vols.json', 'w') as f:
             json.dump(live_data, f, indent=2)
         
-        print(f"\n✓ Saved {len(live_data['vols'])} live vols to live_vols.json")
+        print(f"\n✓ Saved {len(live_data['vols'])} live vols to data/live_vols.json")
         print(f"  Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("\nRefresh your dashboard to see updates!")
     else:

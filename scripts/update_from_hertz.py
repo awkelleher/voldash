@@ -167,7 +167,7 @@ def update_from_hertz_file(hertz_path='C:/Users/AdamKelleher/OneDrive - Prime Tr
     print(f"  Date range: {new_combined['date'].min().date()} to {new_combined['date'].max().date()}")
     
     # Load existing historical data
-    historical_file = 'all_commodity_prices.csv'
+    historical_file = 'data/all_commodity_prices.csv'
     
     if os.path.exists(historical_file):
         print(f"\nLoading existing data from {historical_file}...")

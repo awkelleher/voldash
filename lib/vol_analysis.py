@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 
-def load_historical_data(filepath='master_vol_skew.csv'):
+def load_historical_data(filepath='data/master_vol_skew.csv'):
     """
     Load daily vol/skew data for current display.
     Uses master_vol_skew.csv as the single source of vol/skew history.
@@ -41,7 +41,7 @@ def load_historical_data(filepath='master_vol_skew.csv'):
     return df
 
 
-def load_master_data(filepath='master_vol_skew.csv'):
+def load_master_data(filepath='data/master_vol_skew.csv'):
     """
     Load master historical vol/skew dataset and derive contract_month by
     ordering expiries for each date/commodity.
@@ -690,7 +690,7 @@ def get_percentile_grid_cached(df, date, metric='dirty_vol', lookback_days=252,
     return grid
 
 
-def load_verdad_predictions(filepath='verdad.7.xlsx', sheet='dashboard'):
+def load_verdad_predictions(filepath='data/verdad.7.xlsx', sheet='dashboard'):
     """
     Load predicted realized vol from the verdad workbook.
 
@@ -749,7 +749,7 @@ def load_verdad_predictions(filepath='verdad.7.xlsx', sheet='dashboard'):
 
 
 @functools.lru_cache(maxsize=1)
-def load_options_mapping(path='mapping.csv'):
+def load_options_mapping(path='data/mapping.csv'):
     if not os.path.exists(path):
         return pd.DataFrame(columns=['OPTIONS', 'FUTURES', 'COMMODITY', 'EXPIRY_MONTH'])
     m = pd.read_csv(path)
@@ -816,7 +816,7 @@ def get_contract_options_month_codes(df, date, commodity, max_months=8):
 
 
 @functools.lru_cache(maxsize=1)
-def load_iv_calendar(filepath='IV calendar.xlsm'):
+def load_iv_calendar(filepath='data/IV calendar.xlsm'):
     """Load IV calendar workbook."""
     if not os.path.exists(filepath):
         return None
