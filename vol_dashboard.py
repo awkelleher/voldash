@@ -55,6 +55,61 @@ def load_price_data():
         pass
     return None
 
+
+def lookback_years_from_days(lookback_days: int):
+    """Map trading-day lookback slider to precompute lookback years bucket."""
+    yrs = int(round(float(lookback_days) / 252.0))
+    return max(1, min(12, yrs))
+
+
+@st.cache_data
+def load_iv_snapshot_cached(commodity: str, front_options_month: str, lookback_years):
+    """Load precomputed IV/skew snapshot from parquet cache."""
+    try:
+        import iv_percentiles_precompute as ivp
+        snap, meta = ivp.load_iv_snapshot(commodity, front_options_month, lookback_years)
+        return snap, meta
+    except Exception as e:
+        return pd.DataFrame(), {"error": str(e)}
+
+
+def current_front_options_month(commodity: str, as_of_date):
+    """Get front options month code for commodity/date."""
+    try:
+        import iv_percentiles_precompute as ivp
+        return ivp.get_current_front_month(commodity, pd.to_datetime(as_of_date))
+    except Exception:
+        month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+        return month_codes[pd.to_datetime(as_of_date).month - 1]
+
+
+def assign_contract_month_from_snapshot(tmp: pd.DataFrame, max_months: int = 8) -> pd.DataFrame:
+    """
+    Build unique contract_month ordering from snapshot rows.
+    Prefer trading_dte, then expiry, then curve_position.
+    If multiple years of same options month are present, keep nearest-dated instance.
+    """
+    out = tmp.copy()
+
+    # Keep one row per options month code when available (nearest contract on curve)
+    if 'options_month' in out.columns:
+        if 'trading_dte' in out.columns:
+            out = out.sort_values('trading_dte', na_position='last')
+        elif 'expiry' in out.columns:
+            out = out.sort_values('expiry', na_position='last')
+        out = out.drop_duplicates(subset=['options_month'], keep='first')
+
+    if 'trading_dte' in out.columns:
+        out = out.sort_values('trading_dte', na_position='last').reset_index(drop=True)
+    elif 'expiry' in out.columns:
+        out = out.sort_values('expiry', na_position='last').reset_index(drop=True)
+    elif 'curve_position' in out.columns:
+        out = out.sort_values('curve_position', na_position='last').reset_index(drop=True)
+    if max_months is not None and max_months > 0:
+        out = out.head(max_months).copy()
+    out['contract_month'] = np.arange(1, len(out) + 1)
+    return out
+
 # Bloomberg-style dark theme CSS
 st.markdown("""
     <style>
@@ -203,8 +258,24 @@ st.markdown("""
 # Title
 st.markdown('<div class="bloomberg-header"><span>VOL TRADING DASHBOARD</span></div>', unsafe_allow_html=True)
 
-# Sidebar - Settings
-st.sidebar.header("Settings")
+# Sidebar - Navigation
+NAV_SECTIONS = [
+    "Vol Sheet",
+    "Price Sheet",
+    "Skew Analyzer",
+    "IV Calendar",
+    "Trading Calendar",
+    "Settings",
+]
+active_section = st.sidebar.radio("Navigation", NAV_SECTIONS, key="active_section")
+
+if active_section != "Vol Sheet":
+    st.markdown(f'<div class="bloomberg-header"><span>{active_section.upper()}</span></div>', unsafe_allow_html=True)
+    st.info(f"{active_section} view is coming soon.")
+    st.stop()
+
+# Sidebar - Vol Sheet Settings
+st.sidebar.header("Vol Sheet Settings")
 
 # Load data
 try:
@@ -244,6 +315,7 @@ try:
         max_value=latest_date.date()
     )
     selected_date = pd.to_datetime(selected_date)
+    master_hist = master_df[master_df['date'] < selected_date].copy()
     
     # Commodity selector
     commodity = st.sidebar.selectbox(
@@ -271,21 +343,22 @@ except Exception as e:
 # Main content
 st.markdown(f'<div style="font-family:Consolas,monospace;color:#8b949e;font-size:13px;margin:4px 0 8px 0;">{commodity} &nbsp;|&nbsp; {selected_date.strftime("%Y-%m-%d")} &nbsp;|&nbsp; Lookback: {lookback}d</div>', unsafe_allow_html=True)
 
-# Tab layout
-tab0, tab_pct, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+# Active section selector (compute only selected section)
+tab_options = [
     "POWER GRID",
     "IV %ILE",
     "DASHBOARD",
     "TERM STRUCT",
     "SPREADS",
     "SKEW",
-    "VAR RATIOS"
-])
+    "VAR RATIOS",
+]
+active_tab = st.radio("View", tab_options, horizontal=True, key="active_tab")
 
 # ============================================================================
 # TAB 0: POWER GRID
 # ============================================================================
-with tab0:
+if active_tab == "POWER GRID":
     st.markdown('<div class="bloomberg-header"><span>POWER GRID</span></div>', unsafe_allow_html=True)
     st.caption("(FWD VOL - PREDICTED RV) / FWD VOL  |  Positive = IV rich, Negative = IV cheap")
 
@@ -298,7 +371,10 @@ with tab0:
     verdad_loaded = False
     try:
         import os
-        if os.path.exists('verdad.7.xlsx'):
+        if os.path.exists('verdad.csv'):
+            verdad_overall, verdad_monthly = va.load_verdad_predictions('verdad.csv')
+            verdad_loaded = True
+        elif os.path.exists('verdad.7.xlsx'):
             verdad_overall, verdad_monthly = va.load_verdad_predictions('verdad.7.xlsx')
             verdad_loaded = True
     except Exception as e:
@@ -496,20 +572,36 @@ with tab0:
 # ============================================================================
 # TAB: IV PERCENTILE BATTERY
 # ============================================================================
-with tab_pct:
+if active_tab == "IV %ILE":
     st.markdown('<div class="bloomberg-header"><span>IV PERCENTILE RANK</span></div>', unsafe_allow_html=True)
 
     pct_commodities = ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT']
-    pct_max_months = 8
+    pct_max_months = 12
 
-    # Calculate all percentiles in one shot (dirty vol only)
-    master_hist = master_df[master_df['date'] < selected_date].copy()
+    # Calculate all percentiles from precomputed snapshots (dirty vol only)
+    lookback_years = lookback_years_from_days(lookback)
+    pct_rows = []
+    for c in pct_commodities:
+        front_opt = current_front_options_month(c, selected_date)
+        snap, _meta = load_iv_snapshot_cached(c, front_opt, lookback_years)
+        if isinstance(snap, pd.DataFrame) and len(snap) > 0:
+            tmp = assign_contract_month_from_snapshot(snap, max_months=pct_max_months)
+            tmp['commodity'] = c
+            tmp['current'] = pd.to_numeric(tmp.get('atm_iv', np.nan), errors='coerce')
+            tmp['median'] = pd.to_numeric(tmp.get('iv_hist_median', np.nan), errors='coerce')
+            p = pd.to_numeric(tmp.get('iv_percentile', np.nan), errors='coerce')
+            tmp['percentile'] = np.where(p <= 1, p * 100.0, p)
+            pct_rows.append(tmp[['commodity', 'contract_month', 'current', 'percentile', 'median']])
 
-    pct_grid = va.calculate_percentile_grid(
-        df, selected_date, metric='dirty_vol',
-        lookback_days=lookback, commodities=pct_commodities,
-        max_months=pct_max_months, hist_df=master_hist
-    )
+    if len(pct_rows) > 0:
+        pct_grid = pd.concat(pct_rows, ignore_index=True)
+    else:
+        # Fallback to in-app compute/cache if precompute cache unavailable
+        pct_grid = va.get_percentile_grid_cached(
+            df, selected_date, metric='dirty_vol',
+            lookback_days=lookback, commodities=pct_commodities,
+            max_months=pct_max_months, hist_df=master_hist
+        )
 
     if len(pct_grid) > 0:
         # Build the battery bar HTML for each commodity
@@ -615,7 +707,7 @@ with tab_pct:
 # ============================================================================
 # TAB 1: MAIN DASHBOARD
 # ============================================================================
-with tab1:
+if active_tab == "DASHBOARD":
     # Check if we have live data for this commodity
     live_vol_override = None
     if live_vols and commodity in live_vols.get('vols', {}):
@@ -754,7 +846,7 @@ with tab1:
 # ============================================================================
 # TAB 2: TERM STRUCTURE
 # ============================================================================
-with tab2:
+if active_tab == "TERM STRUCT":
     st.subheader("IV Term Structure - Week Over Week Progression")
     
     term_structure = va.get_iv_term_structure(df, selected_date, commodity)
@@ -801,7 +893,7 @@ with tab2:
 # ============================================================================
 # TAB 3: SPREADS
 # ============================================================================
-with tab3:
+if active_tab == "SPREADS":
     st.subheader("Calendar & Cross-Commodity Spreads")
     
     # Calendar spreads
@@ -887,69 +979,70 @@ with tab3:
 # ============================================================================
 # TAB 4: SKEW ANALYSIS
 # ============================================================================
-with tab4:
-    st.subheader("Skew Analysis vs Historical")
-    
-    skew_summary = va.get_skew_summary(df, selected_date, 1, commodity=commodity, hist_df=master_hist)
-    
-    if len(skew_summary) > 0:
-        # Display as table
-        display_df = skew_summary.copy()
-        display_df.columns = ['Current', 'Percentile', 'Median', 'Distance', 'Lookback', 'Strike']
-        display_df = display_df[['Strike', 'Current', 'Median', 'Percentile', 'Distance']]
-        
-        st.dataframe(
-            display_df.style.format({
-                'Current': '{:.1f}',
-                'Median': '{:.1f}',
-                'Percentile': '{:.1f}%',
-                'Distance': '{:+.1f}'
-            }),
-            use_container_width=True
-        )
-        
-        # Visual comparison
-        st.markdown("**Current vs Median Skew**")
-        
-        chart_data = pd.DataFrame({
-            'Strike': display_df['Strike'],
-            'Current': display_df['Current'],
-            'Median': display_df['Median']
-        }).set_index('Strike')
-        
-        st.line_chart(chart_data)
-        
-        # Percentile heatmap
-        st.markdown("**Percentile Ranks**")
-        percentile_data = display_df.set_index('Strike')['Percentile']
-        
-        # Color code based on percentile
-        def percentile_color(val):
-            if val > 75:
-                return 'background-color: #ff6b6b'
-            elif val > 60:
-                return 'background-color: #ffd93d'
-            elif val < 25:
-                return 'background-color: #6bcf7f'
-            elif val < 40:
-                return 'background-color: #95e1d3'
-            return ''
-        
-        styled_percentiles = display_df[['Strike', 'Percentile']].style.applymap(
-            percentile_color, subset=['Percentile']
-        ).format({'Percentile': '{:.1f}%'})
-        
-        st.dataframe(styled_percentiles, use_container_width=True)
-        
-        st.caption("🟢 Low percentile (<40%) | 🟡 High percentile (>60%) | 🔴 Very high (>75%)")
-    
+if active_tab == "SKEW":
+    st.subheader("Skew - Median (by Front-Month Regime)")
+    st.caption("Columns: P2=-1.5, P1=-0.5, C1=+0.5, C2=+1.5, C3=+3.0 | Cell = current skew - historical median")
+
+    skew_commodities = ['CORN', 'SOY', 'MEAL', 'WHEAT', 'KW', 'OIL']
+    lookback_years = lookback_years_from_days(lookback)
+    skew_rows = []
+    for c in skew_commodities:
+        front_opt = current_front_options_month(c, selected_date)
+        snap, _meta = load_iv_snapshot_cached(c, front_opt, lookback_years)
+        if isinstance(snap, pd.DataFrame) and len(snap) > 0:
+            tmp = assign_contract_month_from_snapshot(snap, max_months=12)
+            tmp['commodity'] = c
+            tmp['month_label'] = tmp['contract_month'].map(lambda x: f"M{int(x)}")
+            for col in ['P2', 'P1', 'C1', 'C2', 'C3']:
+                med_col = f"{col}_hist_median"
+                if col in tmp.columns and med_col in tmp.columns:
+                    tmp[col] = pd.to_numeric(tmp[col], errors='coerce') - pd.to_numeric(tmp[med_col], errors='coerce')
+                else:
+                    tmp[col] = np.nan
+            skew_rows.append(tmp[['commodity', 'contract_month', 'month_label', 'P2', 'P1', 'C1', 'C2', 'C3']])
+
+    if len(skew_rows) > 0:
+        skew_grid = pd.concat(skew_rows, ignore_index=True)
     else:
+        skew_grid = va.get_skew_diff_grid_cached(
+            df, selected_date, commodities=skew_commodities, max_months=8, hist_df=master_hist
+        )
+
+    if len(skew_grid) == 0:
         st.warning("No skew data available")
+    else:
+        def skew_cell_style(val):
+            if pd.isna(val):
+                return ""
+            # Clamp to [-3, 3] and map to red/green intensity
+            v = max(-3.0, min(3.0, float(val)))
+            if v >= 0:
+                # red shades for positive
+                t = int(35 + (v / 3.0) * 120)
+                return f"background-color: rgb({80+t}, 35, 45); color: #e6edf3;"
+            # green shades for negative
+            t = int(35 + (abs(v) / 3.0) * 120)
+            return f"background-color: rgb(30, {70+t}, 60); color: #e6edf3;"
+
+        for c in skew_commodities:
+            cdf = skew_grid[skew_grid['commodity'] == c].sort_values('contract_month')
+            cdf = cdf.drop_duplicates(subset=['contract_month'], keep='last')
+            if len(cdf) == 0:
+                continue
+            st.markdown(f"**{c}**")
+            display = cdf[['month_label', 'P2', 'P1', 'C1', 'C2', 'C3']].set_index('month_label')
+            st.dataframe(
+                display.style
+                .format('{:+.2f}')
+                .applymap(skew_cell_style),
+                use_container_width=True,
+                height=min(320, 40 + 35 * len(display))
+            )
 
 # ============================================================================
 # TAB 5: VARIANCE RATIOS
 # ============================================================================
-with tab5:
+if active_tab == "VAR RATIOS":
     st.subheader("Variance Ratios - Historical Averages")
 
     # Load price data
@@ -1000,11 +1093,11 @@ with tab5:
                 if pd.isna(val):
                     return ''
                 if 0.99 <= val <= 1.01:
-                    return 'background-color: #90EE90'  # Light green for diagonal
+                    return 'background-color: #1f4d2e; color: #e6edf3; font-weight: 600;'  # dark green
                 elif val < 0.7:
-                    return 'background-color: #FFB6C1'  # Light red for low ratios
+                    return 'background-color: #5a1f2a; color: #e6edf3;'  # dark rose
                 elif val > 1.3:
-                    return 'background-color: #ADD8E6'  # Light blue for high ratios
+                    return 'background-color: #1f3f5a; color: #e6edf3;'  # dark blue
                 return ''
 
             # Display the matrix
@@ -1029,7 +1122,10 @@ with tab5:
                 st.write(curve_display)
 
         else:
-            st.warning(f"No variance ratio data available for {front_month} options on {commodity}")
+            if isinstance(metadata, dict) and metadata.get("error"):
+                st.warning(metadata["error"])
+            else:
+                st.warning(f"No variance ratio data available for {front_month} options on {commodity}")
 
     else:
         st.warning("Price data not available. Run update_from_hertz.py to load price data.")

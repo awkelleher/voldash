@@ -12,10 +12,13 @@ import numpy as np
 from datetime import datetime, timedelta
 import functools
 import os
+import json
+from pathlib import Path
 
 
 # Futures month codes in calendar order
 MONTH_CODES = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+CACHE_DIR = Path("cache/variance_ratios")
 
 # Soybean futures months (F, H, K, N, Q, U, X)
 SOY_MONTHS = ['F', 'H', 'K', 'N', 'Q', 'U', 'X']
@@ -51,6 +54,34 @@ def futures_month_sequence(commodity: str, mapping_path: str = 'mapping.csv') ->
     months = subset['FUTURES'].unique().tolist()
     # Fallback to full list if empty
     return months if months else MONTH_CODES
+
+
+def load_cached_variance_ratios(commodity: str,
+                                options_month: str,
+                                lookback_years: int | None = None) -> tuple[pd.DataFrame, dict]:
+    """Load precomputed variance ratio matrix from parquet/json cache."""
+    lb = "all" if lookback_years is None else str(lookback_years)
+    key = f"{commodity.upper()}_{options_month.upper()}_{lb}"
+    matrix_file = CACHE_DIR / f"{key}.parquet"
+    meta_file = CACHE_DIR / f"{key}_meta.json"
+
+    if not matrix_file.exists():
+        return pd.DataFrame(), {}
+
+    try:
+        matrix = pd.read_parquet(matrix_file)
+    except Exception:
+        return pd.DataFrame(), {}
+
+    meta = {}
+    if meta_file.exists():
+        try:
+            with open(meta_file, "r") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+
+    return matrix, meta
 
 
 def get_futures_curve_for_front_month(front_month: str, commodity: str = 'SOY') -> list:
@@ -489,7 +520,7 @@ def _cached_variance_ratio_display(front_options_month: str,
 
     metadata = {
         'front_options_month': front_options_month,
-        'front_futures_month': OPTIONS_TO_FUTURES.get(front_options_month, front_options_month),
+        'front_futures_month': options_to_futures(front_options_month, commodity),
         'commodity': commodity,
         'num_historical_periods': len(periods),
         'years_included': sorted(periods['year'].unique().tolist()) if len(periods) > 0 else [],
@@ -515,8 +546,18 @@ def get_variance_ratio_display(prices_df: pd.DataFrame,
     Returns:
         Tuple of (matrix_df, metadata_dict)
     """
-    # Use cached builder ignoring incoming prices_df to avoid recompute on rerun
-    return _cached_variance_ratio_display(front_options_month, commodity, lookback_years)
+    # 1) Prefer precomputed parquet cache (fast path)
+    cached_matrix, cached_meta = load_cached_variance_ratios(
+        commodity, front_options_month, lookback_years=lookback_years
+    )
+    if isinstance(cached_matrix, pd.DataFrame) and len(cached_matrix) > 0:
+        return cached_matrix, cached_meta if isinstance(cached_meta, dict) else {}
+
+    # 2) Strict cache mode: avoid expensive live recomputation in Streamlit
+    lb = "all" if lookback_years is None else str(lookback_years)
+    return pd.DataFrame(), {
+        "error": f"Cache miss for {commodity}_{front_options_month}_{lb}. Run variance_ratios_precompute.py."
+    }
 
 
 # Test function

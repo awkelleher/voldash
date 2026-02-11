@@ -10,6 +10,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import functools
 import os
+from pathlib import Path
 
 
 def load_historical_data(filepath='master_vol_skew.csv'):
@@ -294,6 +295,107 @@ def get_skew_summary(df, date, contract_month, commodity=None, hist_df=None, ske
     return pd.DataFrame(results)
 
 
+def get_skew_summary_cached(df, date, contract_month, commodity=None, hist_df=None, skew_columns=None):
+    """
+    Parquet-backed cache for skew percentile summaries.
+    """
+    cache_dir = Path("cache/skew_percentiles")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    date_key = pd.to_datetime(date).strftime("%Y%m%d")
+    comm_key = str(commodity) if commodity is not None else "ALL"
+    cm_key = int(contract_month)
+    cache_name = f"{date_key}_{comm_key}_{cm_key}.parquet"
+    cache_path = cache_dir / cache_name
+
+    if cache_path.exists():
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            pass
+
+    summary = get_skew_summary(
+        df, date, contract_month, commodity=commodity,
+        hist_df=hist_df, skew_columns=skew_columns
+    )
+    try:
+        summary.to_parquet(cache_path, index=False)
+    except Exception:
+        pass
+    return summary
+
+
+def _detect_skew_columns(df):
+    """Detect skew schema and return ordered (column, label) pairs."""
+    candidates = [
+        (['skew_m1.5', 'skew_m0.5', 'skew_p0.5', 'skew_p1.5', 'skew_p3.0'], ['P2', 'P1', 'C1', 'C2', 'C3']),
+        (['skew_neg15', 'skew_neg05', 'skew_pos05', 'skew_pos15', 'skew_pos3'], ['P2', 'P1', 'C1', 'C2', 'C3']),
+    ]
+    cols = set(df.columns)
+    for src, labels in candidates:
+        if all(c in cols for c in src):
+            return list(zip(src, labels))
+    return []
+
+
+def get_skew_diff_grid_cached(df, date, commodities=None, max_months=8, hist_df=None):
+    """
+    Build and cache a skew-difference grid:
+    cell = current skew - historical median skew.
+    """
+    if commodities is None:
+        commodities = sorted(df['commodity'].dropna().unique().tolist())
+    if hist_df is None:
+        hist_df = df
+
+    cache_dir = Path("cache/skew_diff_grid")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    date_key = pd.to_datetime(date).strftime("%Y%m%d")
+    comm_key = "-".join(sorted([str(c) for c in commodities]))
+    cache_path = cache_dir / f"{date_key}_{max_months}_{comm_key}.parquet"
+
+    if cache_path.exists():
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            pass
+
+    skew_pairs = _detect_skew_columns(hist_df)
+    if not skew_pairs:
+        return pd.DataFrame()
+
+    rows = []
+    for commodity in commodities:
+        for cm in range(1, max_months + 1):
+            out = {
+                'commodity': commodity,
+                'contract_month': cm,
+                'month_label': f"M{cm}",
+                'P2': np.nan,
+                'P1': np.nan,
+                'C1': np.nan,
+                'C2': np.nan,
+                'C3': np.nan,
+            }
+            has_data = False
+            for metric_col, label in skew_pairs:
+                stats = calculate_percentile_rank(
+                    df, date, cm, metric_col, commodity=commodity, hist_df=hist_df
+                )
+                if stats is not None:
+                    out[label] = stats['distance_from_median']
+                    has_data = True
+            if has_data:
+                rows.append(out)
+
+    result = pd.DataFrame(rows)
+    try:
+        result.to_parquet(cache_path, index=False)
+    except Exception:
+        pass
+    return result
+
+
 def forward_vol_vs_predicted(df, date, contract_month, predicted_rv):
     """
     Compare your forward vol calculation to your model's predicted realized vol
@@ -557,6 +659,37 @@ def calculate_percentile_grid(df, date, metric='clean_vol', lookback_days=252,
     return pd.DataFrame(results)
 
 
+def get_percentile_grid_cached(df, date, metric='dirty_vol', lookback_days=252,
+                               commodities=None, max_months=8, hist_df=None):
+    """
+    Parquet-backed cache for percentile grids.
+    """
+    if commodities is None:
+        commodities = sorted(df['commodity'].unique())
+    cache_dir = Path("cache/iv_percentiles")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    date_key = pd.to_datetime(date).strftime("%Y%m%d")
+    comm_key = "-".join(sorted([str(c) for c in commodities]))
+    cache_name = f"{date_key}_{metric}_{lookback_days}_{max_months}_{comm_key}.parquet"
+    cache_path = cache_dir / cache_name
+
+    if cache_path.exists():
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            pass
+
+    grid = calculate_percentile_grid(
+        df, date, metric=metric, lookback_days=lookback_days,
+        commodities=commodities, max_months=max_months, hist_df=hist_df
+    )
+    try:
+        grid.to_parquet(cache_path, index=False)
+    except Exception:
+        pass
+    return grid
+
+
 def load_verdad_predictions(filepath='verdad.7.xlsx', sheet='dashboard'):
     """
     Load predicted realized vol from the verdad workbook.
@@ -571,15 +704,29 @@ def load_verdad_predictions(filepath='verdad.7.xlsx', sheet='dashboard'):
         overall: dict {commodity: predicted_rv}
         monthly: dict {commodity: {month_code: predicted_rv}}
     """
-    dash = pd.read_excel(filepath, sheet_name=sheet, header=None)
-
     # Column mapping: verdad column names -> our commodity names
     col_map = {'S': 'SOY', 'SM': 'MEAL', 'BO': 'OIL', 'C': 'CORN', 'W': 'WHEAT', 'KW': 'KW'}
 
-    # Read column headers from row 0 (skip first col which is label)
+    # CSV format: first column = month code, headers = S/SM/BO/C/W/KW
+    if str(filepath).lower().endswith('.csv'):
+        vdf = pd.read_csv(filepath)
+        month_col = vdf.columns[0]
+        vdf[month_col] = vdf[month_col].astype(str).str.upper().str.strip()
+        monthly = {c: {} for c in col_map.values()}
+        for _, r in vdf.iterrows():
+            m = str(r[month_col]).strip()
+            if len(m) != 1:
+                continue
+            for src, dst in col_map.items():
+                if src in vdf.columns and pd.notna(r[src]):
+                    monthly[dst][m] = float(r[src])
+        overall = {k: (float(np.nanmean(list(v.values()))) if len(v) > 0 else np.nan) for k, v in monthly.items()}
+        return overall, monthly
+
+    # Excel format
+    dash = pd.read_excel(filepath, sheet_name=sheet, header=None)
     headers = [str(dash.iloc[0, i]).strip() for i in range(1, dash.shape[1])]
 
-    # Overall level (row 1)
     overall = {}
     for i, h in enumerate(headers):
         if h in col_map:
@@ -587,10 +734,9 @@ def load_verdad_predictions(filepath='verdad.7.xlsx', sheet='dashboard'):
             if pd.notna(val):
                 overall[col_map[h]] = float(val)
 
-    # Monthly breakdown (rows 4-15)
     monthly = {c: {} for c in col_map.values()}
     for row_idx in range(4, 16):
-        month_code = str(dash.iloc[row_idx, 0]).strip()
+        month_code = str(dash.iloc[row_idx, 0]).strip().upper()
         if len(month_code) != 1:
             continue
         for i, h in enumerate(headers):
@@ -600,6 +746,73 @@ def load_verdad_predictions(filepath='verdad.7.xlsx', sheet='dashboard'):
                     monthly[col_map[h]][month_code] = float(val)
 
     return overall, monthly
+
+
+@functools.lru_cache(maxsize=1)
+def load_options_mapping(path='mapping.csv'):
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=['OPTIONS', 'FUTURES', 'COMMODITY', 'EXPIRY_MONTH'])
+    m = pd.read_csv(path)
+    for c in ['OPTIONS', 'FUTURES', 'COMMODITY']:
+        if c in m.columns:
+            m[c] = m[c].astype(str).str.upper().str.strip()
+    return m
+
+
+def get_contract_options_month_codes(df, date, commodity, max_months=8):
+    """
+    Map contract_month -> OPTIONS month code (H/J/K/...) using mapping.csv and expiry month.
+    """
+    data = df[(df['date'] == date) & (df['commodity'] == commodity)].sort_values('contract_month')
+    m = load_options_mapping()
+    lookup = {}
+    if len(m) > 0 and 'EXPIRY_MONTH' in m.columns:
+        sub = m[m['COMMODITY'] == str(commodity).upper()]
+        if len(sub) > 0:
+            lookup = {(int(r['EXPIRY_MONTH'])): r['OPTIONS'] for _, r in sub.iterrows() if pd.notna(r.get('EXPIRY_MONTH', np.nan))}
+
+    # Preferred mapping: start from current FRONT options month (by observation month),
+    # then roll forward through the options month cycle.
+    mapping = {}
+    try:
+        if len(lookup) > 0:
+            current_month = pd.to_datetime(date).month
+            front_code = lookup.get(int(current_month), None)
+
+            # Build ordered options cycle by calendar month 1..12
+            cycle = [lookup.get(i, None) for i in range(1, 13)]
+            cycle = [c for c in cycle if c is not None]
+
+            if front_code and front_code in cycle:
+                start_idx = cycle.index(front_code)
+                rolled = cycle[start_idx:] + cycle[:start_idx] + cycle
+                for _, r in data.iterrows():
+                    cm = int(r['contract_month'])
+                    if 1 <= cm <= max_months and (cm - 1) < len(rolled):
+                        mapping[cm] = rolled[cm - 1]
+    except Exception:
+        mapping = {}
+
+    # Fallback: expiry-month based mapping
+    if len(mapping) == 0:
+        for _, r in data.iterrows():
+            cm = int(r['contract_month'])
+            if cm > max_months:
+                continue
+            exp = r.get('expiry', None)
+            if pd.notna(exp):
+                try:
+                    em = pd.to_datetime(exp).month
+                    code = lookup.get(em, None)
+                    if code:
+                        mapping[cm] = code
+                except Exception:
+                    pass
+
+    # Final fallback to legacy code mapper if needed
+    if len(mapping) == 0:
+        return get_contract_month_codes(df, date, commodity, max_months=max_months)
+    return mapping
 
 
 @functools.lru_cache(maxsize=1)
@@ -779,10 +992,10 @@ def calculate_power_grid(df, date, predicted_rv_dict, commodities=None, max_mont
             (df['date'] == date) & (df['commodity'] == commodity)
         ].sort_values('contract_month')
 
-        # Get month code mapping if we have monthly predictions
+        # Get options month code mapping if we have monthly predictions
         cm_to_code = {}
         if monthly_predictions and commodity in monthly_predictions:
-            cm_to_code = get_contract_month_codes(df, date, commodity, max_months)
+            cm_to_code = get_contract_options_month_codes(df, date, commodity, max_months)
 
         row = {}
         fv_row = {}
