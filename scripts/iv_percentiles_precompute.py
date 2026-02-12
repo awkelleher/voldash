@@ -370,11 +370,11 @@ def precompute_all(commodity_filter: str = None, month_filter: str = None):
                 lb_str = "all" if lookback is None else f"{lookback}y"
                 label = f"{commodity} {month} ({lb_str})"
 
-                # Skip if cache is fresh (< 7 days old)
+                # Skip if cache is fresh (< 30 days old)
                 out = _snapshot_path(commodity, month, lookback)
                 if out.exists():
                     age_days = (datetime.now().timestamp() - out.stat().st_mtime) / 86400
-                    if age_days < 7:
+                    if age_days < 30:
                         skipped += 1
                         continue
 

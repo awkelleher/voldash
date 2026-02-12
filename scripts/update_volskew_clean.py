@@ -153,28 +153,57 @@ def main():
         log.error(f'Input not found: {input_file}')
         sys.exit(1)
 
+    # Determine cutoff: only parse dates after the latest in master
+    cutoff_date = None
+    if os.path.exists(output_file):
+        existing_df = pd.read_csv(output_file)
+        existing_df['date'] = pd.to_datetime(existing_df['date'], format='mixed').dt.strftime('%Y-%m-%d')
+        cutoff_date = max(existing_df['date'])
+        log.info(f'Existing master: {len(existing_df)} records (latest: {cutoff_date})')
+    else:
+        existing_df = None
+
     # Parse
     log.info(f'Parsing {os.path.basename(input_file)}...')
-    records = parse_csv_file(input_file)
-    new_df = pd.DataFrame(records)
+    all_records = parse_csv_file(input_file)
 
-    if new_df.empty:
+    if not all_records:
         log.warning('No valid data found. Exiting.')
         sys.exit(1)
 
+    # Filter to only new dates
+    if cutoff_date:
+        new_records = [r for r in all_records if r['date'] > cutoff_date]
+        all_dates = sorted(set(r['date'] for r in all_records))
+        log.info(f'  Parsed {len(all_records)} records, {len(all_dates)} dates ({all_dates[0]} to {all_dates[-1]})')
+    else:
+        new_records = all_records
+
+    # Filter out bad rows where expiry < date
+    clean_records = []
+    bad_count = 0
+    for r in new_records:
+        if r['expiry'] and r['date'] and r['expiry'] < r['date']:
+            bad_count += 1
+        else:
+            clean_records.append(r)
+
+    if bad_count:
+        log.info(f'  Filtered {bad_count} rows where expiry < date')
+
+    new_df = pd.DataFrame(clean_records)
+
+    if new_df.empty:
+        log.info('No new dates to add. Master is up to date.')
+        sys.exit(0)
+
     new_dates = sorted(new_df['date'].unique())
-    log.info(f'  {len(new_df)} records, {len(new_dates)} dates ({new_dates[0]} to {new_dates[-1]})')
+    log.info(f'  +{len(new_df)} new records for {len(new_dates)} dates ({new_dates[0]} to {new_dates[-1]})')
 
-    # Merge with master
-    if os.path.exists(output_file):
-        existing_df = pd.read_csv(output_file)
-        before = len(existing_df)
-        log.info(f'Existing master: {before} records ({existing_df["date"].min()} to {existing_df["date"].max()})')
-
+    # Append to master
+    if existing_df is not None:
         combined = pd.concat([existing_df, new_df], ignore_index=True)
         combined = combined.drop_duplicates(subset=['date', 'commodity', 'expiry'], keep='last')
-        added = len(combined) - before
-        log.info(f'  +{added} new, {len(new_df) - added} dupes skipped')
     else:
         combined = new_df.drop_duplicates(subset=['date', 'commodity', 'expiry'], keep='last')
         log.info(f'Created new master with {len(combined)} records')

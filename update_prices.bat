@@ -22,7 +22,7 @@ REM ========================================================================
 REM STEP 1: Update Prices from HertzDR.xlsm
 REM ========================================================================
 echo.
-echo [STEP 1/2] Updating futures prices...
+echo [STEP 1/5] Updating futures prices...
 echo ========================================================================
 
 REM Check if HertzDR.xlsm exists
@@ -49,7 +49,7 @@ REM STEP 2: Update Vol/Skew Data
 REM ========================================================================
 :vol_update
 echo.
-echo [STEP 2/2] Updating vol/skew data...
+echo [STEP 2/5] Updating vol/skew data...
 echo ========================================================================
 
 REM Check if end of day snapshot exists
@@ -72,6 +72,60 @@ if %errorlevel% equ 0 (
 ) else (
     echo ERROR: Vol/skew update failed
     echo %date% %time% - Vol/skew update FAILED >> logs\update_errors.log
+)
+
+REM ========================================================================
+REM STEP 3: Recompute Realized Vol Cache
+REM ========================================================================
+:rv_update
+echo.
+echo [STEP 3/5] Recomputing realized vol...
+echo ========================================================================
+
+python scripts\precompute_realized_vol.py --force
+
+if %errorlevel% equ 0 (
+    echo SUCCESS: Realized vol recompute completed
+    echo %date% %time% - Realized vol recompute SUCCESS >> logs\update_log.txt
+) else (
+    echo ERROR: Realized vol recompute failed
+    echo %date% %time% - Realized vol recompute FAILED >> logs\update_errors.log
+)
+
+REM ========================================================================
+REM STEP 4: Recompute Correlation Matrices
+REM ========================================================================
+:corr_update
+echo.
+echo [STEP 4/5] Recomputing correlations...
+echo ========================================================================
+
+python scripts\precompute_correlations.py --force
+
+if %errorlevel% equ 0 (
+    echo SUCCESS: Correlation recompute completed
+    echo %date% %time% - Correlation recompute SUCCESS >> logs\update_log.txt
+) else (
+    echo ERROR: Correlation recompute failed
+    echo %date% %time% - Correlation recompute FAILED >> logs\update_errors.log
+)
+
+REM ========================================================================
+REM STEP 5: Recompute IV Percentiles + Skew Percentiles
+REM ========================================================================
+:iv_update
+echo.
+echo [STEP 5/5] Recomputing IV percentiles...
+echo ========================================================================
+
+python scripts\iv_percentiles_precompute.py
+
+if %errorlevel% equ 0 (
+    echo SUCCESS: IV percentiles recompute completed
+    echo %date% %time% - IV percentiles recompute SUCCESS >> logs\update_log.txt
+) else (
+    echo ERROR: IV percentiles recompute failed
+    echo %date% %time% - IV percentiles recompute FAILED >> logs\update_errors.log
 )
 
 REM ========================================================================

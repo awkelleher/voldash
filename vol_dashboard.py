@@ -12,6 +12,9 @@ from lib import vol_analysis as va
 from lib import variance_ratios as vr
 from datetime import datetime, timedelta
 
+if "theme_mode" not in st.session_state:
+    st.session_state["theme_mode"] = "Dark"
+
 # Page config
 st.set_page_config(
     page_title="Vol Trading Dashboard",
@@ -71,6 +74,25 @@ def load_realized_vol_data():
 
 
 @st.cache_data(ttl=30)
+def load_correlation_data():
+    """Load precomputed correlation matrix rows."""
+    try:
+        if os.path.exists('cache/correlation_matrices.csv'):
+            cdf = pd.read_csv('cache/correlation_matrices.csv')
+            if 'window' in cdf.columns:
+                cdf['window'] = pd.to_numeric(cdf['window'], errors='coerce').astype('Int64')
+            if 'correlation' in cdf.columns:
+                cdf['correlation'] = pd.to_numeric(cdf['correlation'], errors='coerce')
+            for c in ['commodity_1', 'commodity_2']:
+                if c in cdf.columns:
+                    cdf[c] = cdf[c].astype(str).str.upper().str.strip()
+            return cdf
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=30)
 def get_source_update_timestamps():
     """Return filesystem modified timestamps for primary source files."""
     def _fmt(path):
@@ -83,6 +105,7 @@ def get_source_update_timestamps():
         return "unavailable"
 
     return {
+        "live_data": _fmt('data/live_vols.csv'),
         "master_vol_skew": _fmt('data/master_vol_skew.csv'),
         "all_commodity_prices": _fmt('data/all_commodity_prices.csv'),
     }
@@ -149,7 +172,8 @@ def build_vol_change_table(
     selected_date,
     long_window: int,
     max_months: int = 12,
-    live_df: pd.DataFrame | None = None
+    live_df: pd.DataFrame | None = None,
+    master_df: pd.DataFrame | None = None
 ):
     """
     Build table for 1-day and N-day changes in IV (dirty_vol) and fwd_vol.
@@ -187,11 +211,25 @@ def build_vol_change_table(
         return pd.DataFrame(), {"error": f"No data on/before {asof.date()}"}
 
     current_date = dates[idx]
-    prev_date = dates[idx - 1] if idx - 1 >= 0 else None
-    long_date = dates[idx - long_window] if idx - long_window >= 0 else None
+
+    # Reference dates for change calculations come from MASTER history only.
+    # 1D = latest master date; ND = Nth-latest master date.
+    if master_df is not None and len(master_df) > 0:
+        mdf = master_df[master_df['commodity'] == commodity].copy()
+        mdf['date'] = pd.to_datetime(mdf['date'], errors='coerce')
+        master_dates = pd.DatetimeIndex(mdf['date'].dropna().sort_values().unique())
+    else:
+        master_dates = dates
+
+    master_dates = master_dates[master_dates <= current_date]
+    if len(master_dates) == 0:
+        return pd.DataFrame(), {"error": f"No master history available for {commodity}"}
+
+    prev_date = master_dates[-1] if len(master_dates) >= 1 else None
+    long_date = master_dates[-long_window] if len(master_dates) >= long_window else None
 
     current = cdf[cdf['date'] == current_date][['contract_month', 'expiry', 'dirty_vol', 'fwd_vol']].copy()
-    current = current.sort_values('contract_month').head(max_months)
+    current = current.sort_values(['contract_month', 'expiry']).drop_duplicates(subset=['expiry'], keep='first').head(max_months)
     current = current.rename(columns={'dirty_vol': 'iv_now', 'fwd_vol': 'fwd_now'})
 
     # Build display contract code from expiry using commodity-specific OPTIONS mapping
@@ -211,17 +249,32 @@ def build_vol_change_table(
         options_lookup = {}
 
     exp_dt = pd.to_datetime(current['expiry'], errors='coerce')
+    opt_code = exp_dt.dt.month.map(
+        lambda m: options_lookup.get(int(m), month_code.get(int(m), '?')) if pd.notna(m) else '?'
+    )
+    # Contract-year convention: F contracts are labeled with next calendar year.
+    # Example: 2026-12-24 expiry -> F27.
+    contract_year = exp_dt.dt.year + np.where(opt_code == 'F', 1, 0)
     current['contract_code'] = (
-        exp_dt.dt.month.map(lambda m: options_lookup.get(int(m), month_code.get(int(m), '?')) if pd.notna(m) else '?')
-        + exp_dt.dt.year.mod(100).fillna(0).astype(int).astype(str).str.zfill(2)
+        opt_code.astype(str)
+        + contract_year.mod(100).fillna(0).astype(int).astype(str).str.zfill(2)
     )
 
-    out = current[['contract_month', 'contract_code', 'iv_now', 'fwd_now']].copy()
+    out = current[['contract_month', 'expiry', 'contract_code', 'iv_now', 'fwd_now']].copy()
+
+    # Baseline values should come from MASTER history (not live-overlaid cdf)
+    ref_base = cdf
+    if master_df is not None and len(master_df) > 0:
+        ref_base = master_df[master_df['commodity'] == commodity].copy()
+        ref_base['date'] = pd.to_datetime(ref_base['date'], errors='coerce')
+        if 'expiry' in ref_base.columns:
+            ref_base['expiry'] = pd.to_datetime(ref_base['expiry'], errors='coerce')
 
     if prev_date is not None:
-        prev = cdf[cdf['date'] == prev_date][['contract_month', 'dirty_vol', 'fwd_vol']].copy()
+        prev = ref_base[ref_base['date'] == prev_date][['expiry', 'dirty_vol', 'fwd_vol']].copy()
+        prev = prev.sort_values('expiry').drop_duplicates(subset=['expiry'], keep='last')
         prev = prev.rename(columns={'dirty_vol': 'iv_prev_1d', 'fwd_vol': 'fwd_prev_1d'})
-        out = out.merge(prev, on='contract_month', how='left')
+        out = out.merge(prev, on='expiry', how='left')
         out['iv_chg_1d'] = out['iv_now'] - out['iv_prev_1d']
         out['fwd_chg_1d'] = out['fwd_now'] - out['fwd_prev_1d']
     else:
@@ -229,9 +282,10 @@ def build_vol_change_table(
         out['fwd_chg_1d'] = np.nan
 
     if long_date is not None:
-        long_df = cdf[cdf['date'] == long_date][['contract_month', 'dirty_vol', 'fwd_vol']].copy()
+        long_df = ref_base[ref_base['date'] == long_date][['expiry', 'dirty_vol', 'fwd_vol']].copy()
+        long_df = long_df.sort_values('expiry').drop_duplicates(subset=['expiry'], keep='last')
         long_df = long_df.rename(columns={'dirty_vol': 'iv_prev_long', 'fwd_vol': 'fwd_prev_long'})
-        out = out.merge(long_df, on='contract_month', how='left')
+        out = out.merge(long_df, on='expiry', how='left')
         out['iv_chg_long'] = out['iv_now'] - out['iv_prev_long']
         out['fwd_chg_long'] = out['fwd_now'] - out['fwd_prev_long']
     else:
@@ -239,6 +293,8 @@ def build_vol_change_table(
         out['fwd_chg_long'] = np.nan
 
     out = out.sort_values('contract_month').reset_index(drop=True)
+    if 'expiry' in out.columns:
+        out = out.drop(columns=['expiry'])
     return out, {
         "current_date": current_date,
         "prev_date": prev_date,
@@ -388,13 +444,68 @@ st.markdown("""
     .stSlider label {
         color: #8b949e !important;
     }
+
+    /* Buttons - soft green */
+    .stButton > button {
+        background-color: #1f4d2e !important;
+        color: #d7f5df !important;
+        border: 1px solid #2f6f44 !important;
+        border-radius: 6px !important;
+    }
+    .stButton > button:hover {
+        background-color: #275f38 !important;
+        border-color: #3a8653 !important;
+        color: #e8fff0 !important;
+    }
     </style>
 """, unsafe_allow_html=True)
+
+# Optional light-theme overrides (applied on top of defaults)
+if st.session_state.get("theme_mode", "Dark") == "Light":
+    st.markdown("""
+        <style>
+        .stApp {
+            background-color: #f6f8fa !important;
+            color: #1f2328 !important;
+        }
+        section[data-testid="stSidebar"] {
+            background-color: #ffffff !important;
+            border-right: 1px solid #d0d7de !important;
+        }
+        section[data-testid="stSidebar"] .stMarkdown p,
+        section[data-testid="stSidebar"] .stMarkdown span,
+        section[data-testid="stSidebar"] label {
+            color: #57606a !important;
+        }
+        h1, h2, h3, h4, h5, h6 {
+            color: #1f2328 !important;
+        }
+        .stMarkdown p, .stMarkdown li, .stMarkdown span {
+            color: #1f2328 !important;
+        }
+        .bloomberg-header {
+            background-color: #ffffff !important;
+            border-bottom: 2px solid #d97706 !important;
+        }
+        [data-testid="stMetric"] {
+            background-color: #ffffff !important;
+            border: 1px solid #d0d7de !important;
+        }
+        .stAlert {
+            background-color: #ffffff !important;
+            border: 1px solid #d0d7de !important;
+            color: #1f2328 !important;
+        }
+        .stDataFrame {
+            border: 1px solid #d0d7de !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
 # Title
 st.markdown('<div class="bloomberg-header"><span>VOL TRADING DASHBOARD</span></div>', unsafe_allow_html=True)
 
-# Sidebar - Navigation
+# Top navigation + global live controls
 NAV_SECTIONS = [
     "Vol Sheet",
     "Price Sheet",
@@ -403,20 +514,47 @@ NAV_SECTIONS = [
     "Trading Calendar",
     "Settings",
 ]
-active_section = st.sidebar.radio("Navigation", NAV_SECTIONS, key="active_section")
+default_section = st.session_state.get("active_section", "Vol Sheet")
+# Use full-width segmented control so all tabs stay on one line.
+active_section = st.segmented_control(
+    "Navigation",
+    NAV_SECTIONS,
+    default=default_section if default_section in NAV_SECTIONS else "Vol Sheet",
+    key="active_section",
+    label_visibility="collapsed"
+)
+if active_section is None:
+    active_section = "Vol Sheet"
 
-if active_section not in ["Vol Sheet", "Price Sheet"]:
+if active_section not in ["Vol Sheet", "Price Sheet", "Skew Analyzer", "IV Calendar", "Trading Calendar", "Settings"]:
     st.markdown(f'<div class="bloomberg-header"><span>{active_section.upper()}</span></div>', unsafe_allow_html=True)
     st.info(f"{active_section} view is coming soon.")
     st.stop()
 
-# Sidebar - Vol Sheet Settings
-st.sidebar.header("Vol Sheet Settings")
+if active_section == "Settings":
+    st.markdown('<div class="bloomberg-header"><span>SETTINGS</span></div>', unsafe_allow_html=True)
+    st.subheader("Theme")
+    current_mode = st.session_state.get("theme_mode", "Dark")
+    light_mode = st.toggle("Light mode", value=(current_mode == "Light"))
+    selected_mode = "Light" if light_mode else "Dark"
+    if selected_mode != current_mode:
+        st.session_state["theme_mode"] = selected_mode
+        st.rerun()
+    st.caption(f"Current mode: {selected_mode}")
+
+    st.markdown("---")
+    st.subheader("Data Timestamps")
+    _updates = get_source_update_timestamps()
+    st.markdown(f"- Live data: `{_updates.get('live_data', 'unavailable')}`")
+    st.markdown(f"- Vol data: `{_updates.get('master_vol_skew', 'unavailable')}`")
+    st.markdown(f"- Price data: `{_updates.get('all_commodity_prices', 'unavailable')}`")
+    st.stop()
 
 # Load data
 try:
     df = load_data()
     master_df = load_master()
+    master_base_df = master_df.copy()
     live_df = load_live_data()
 
     # Ensure datetime for date columns
@@ -448,70 +586,15 @@ try:
         st.error("No dates found in data.")
         st.stop()
 
-    # Live data indicator + refresh button
-    if live_df is not None and not live_df.empty:
-        live_ts = os.path.getmtime('data/live_vols.csv')
-        live_time = datetime.fromtimestamp(live_ts).strftime('%H:%M:%S')
-        st.sidebar.success(f"LIVE DATA: {live_time}")
-
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        if st.button("Refresh Live"):
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ['python', 'scripts/xlsm_to_csv.py', '-o', 'data/live_vols.csv'],
-                    capture_output=True, text=True, timeout=60
-                )
-                if result.returncode == 0:
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    st.sidebar.error(f"Error: {result.stderr[-200:]}")
-            except Exception as e:
-                st.sidebar.error(f"Failed: {e}")
-    with col2:
-        if live_df is not None and not live_df.empty:
-            if st.button("Clear Live"):
-                os.remove('data/live_vols.csv')
-                st.cache_data.clear()
-                st.rerun()
-    
-    # Date selector
-    selected_date = st.sidebar.date_input(
-        "Analysis Date",
-        value=latest_date.date(),
-        min_value=earliest_date.date(),
-        max_value=latest_date.date()
-    )
-    selected_date = pd.to_datetime(selected_date)
+    # Default analysis context (navigation-only sidebar; no per-view controls)
+    selected_date = pd.to_datetime(latest_date)
     master_hist = master_df[master_df['date'] < selected_date].copy()
-    
-    # Commodity selector
-    commodity = st.sidebar.selectbox(
-        "Commodity",
-        ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT']
-    )
-    
-    # Lookback period
-    lookback = st.sidebar.slider(
-        "Historical Lookback (trading days)",
-        min_value=60,
-        max_value=504,
-        value=252
-    )
-    
-    st.sidebar.markdown("---")
-    st.sidebar.caption(f"Data range: {earliest_date.date()} to {latest_date.date()}")
-    st.sidebar.caption(f"Total records: {len(df):,}")
-    st.sidebar.caption(f"Trading days: {df['date'].nunique():,}")
+    commodity = 'SOY'
+    lookback = 252
     
 except Exception as e:
     st.error(f"Error loading data: {str(e)}")
     st.stop()
-
-# Main content
-st.markdown(f'<div style="font-family:Consolas,monospace;color:#8b949e;font-size:13px;margin:4px 0 8px 0;">{commodity} &nbsp;|&nbsp; {selected_date.strftime("%Y-%m-%d")} &nbsp;|&nbsp; Lookback: {lookback}d</div>', unsafe_allow_html=True)
 
 # Active section selector (compute only selected section)
 if active_section == "Vol Sheet":
@@ -525,19 +608,35 @@ if active_section == "Vol Sheet":
         "SKEW",
     ]
     active_tab = st.radio("View", tab_options, horizontal=True, key="active_tab_vol")
-else:
+    price_product = None
+elif active_section == "Price Sheet":
     st.markdown('<div class="bloomberg-header"><span>PRICE SHEET</span></div>', unsafe_allow_html=True)
-    price_product = st.selectbox(
-        "Product",
-        ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW'],
-        index=0,
-        key="price_sheet_product"
-    )
     price_tab_options = [
         "VAR RATIOS",
         "REALIZED VOL",
+        "CORRELATIONS",
     ]
     active_tab = st.radio("View", price_tab_options, horizontal=True, key="active_tab_price")
+    price_product = None
+    if active_tab in ["VAR RATIOS", "REALIZED VOL"]:
+        price_product = st.selectbox(
+            "Product",
+            ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW'],
+            index=0,
+            key="price_sheet_product"
+        )
+elif active_section == "Skew Analyzer":
+    st.markdown('<div class="bloomberg-header"><span>SKEW ANALYZER</span></div>', unsafe_allow_html=True)
+    active_tab = "SKEW"
+    price_product = None
+elif active_section == "IV Calendar":
+    st.markdown('<div class="bloomberg-header"><span>IV CALENDAR</span></div>', unsafe_allow_html=True)
+    active_tab = "IV %ILE"
+    price_product = None
+elif active_section == "Trading Calendar":
+    st.markdown('<div class="bloomberg-header"><span>TRADING CALENDAR</span></div>', unsafe_allow_html=True)
+    active_tab = "TRADING CALENDAR"
+    price_product = None
 
 # ============================================================================
 # TAB 0: POWER GRID
@@ -546,7 +645,7 @@ if active_tab == "POWER GRID":
     st.markdown('<div class="bloomberg-header"><span>POWER GRID</span></div>', unsafe_allow_html=True)
     st.caption("(FWD VOL - PREDICTED RV) / FWD VOL  |  Positive = IV rich, Negative = IV cheap")
 
-    grid_commodities = ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT']
+    grid_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
     max_grid_months = 8
 
     # Load predicted RV from verdad workbook
@@ -625,69 +724,90 @@ if active_tab == "POWER GRID":
         pred_rvs_df = power_meta['pred_rvs']
         month_codes_df = power_meta.get('month_codes', pd.DataFrame())
 
-        # Build HTML table for Bloomberg-style display
-        def _power_color(val):
-            """Return CSS color for a power value."""
+        # Display matrix as Contract x Commodity (swapped orientation), using contract codes.
+        def _contract_sort_key(code):
+            month_rank = {'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6, 'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12}
+            s = str(code) if pd.notna(code) else ""
+            if len(s) < 2:
+                return (9999, 99)
+            try:
+                yy = int(s[1:])
+            except Exception:
+                yy = 9999
+            return (yy, month_rank.get(s[0], 99))
+
+        def _contract_labels_for_commodity(comm):
+            labels = {}
+            day = df[(df['date'] == selected_date) & (df['commodity'] == comm)].sort_values('contract_month')
+            if len(day) == 0:
+                return labels
+            lookup = {}
+            try:
+                m = va.load_options_mapping('data/mapping.csv')
+                sub = m[m['COMMODITY'] == str(comm).upper()]
+                if len(sub) > 0 and 'EXPIRY_MONTH' in sub.columns:
+                    lookup = {
+                        int(r['EXPIRY_MONTH']): str(r['OPTIONS']).upper()
+                        for _, r in sub.iterrows()
+                        if pd.notna(r.get('EXPIRY_MONTH', np.nan)) and pd.notna(r.get('OPTIONS', np.nan))
+                    }
+            except Exception:
+                lookup = {}
+            fallback = {1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M', 7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'}
+            for _, r in day.iterrows():
+                cm = int(r['contract_month'])
+                if cm > max_grid_months:
+                    continue
+                exp = pd.to_datetime(r.get('expiry', None), errors='coerce')
+                if pd.isna(exp):
+                    continue
+                code = lookup.get(int(exp.month), fallback.get(int(exp.month), '?'))
+                year = int(exp.year) + (1 if code == 'F' else 0)
+                labels[f"M{cm}"] = f"{code}{str(year % 100).zfill(2)}"
+            return labels
+
+        contract_maps = {c: _contract_labels_for_commodity(c) for c in grid_commodities}
+        contracts = set()
+        for c in grid_commodities:
+            if c in power_df.index:
+                for mcol in power_df.columns:
+                    if pd.notna(power_df.loc[c, mcol]):
+                        contracts.add(contract_maps.get(c, {}).get(mcol, mcol))
+        contracts = sorted(list(contracts), key=_contract_sort_key)
+
+        display = pd.DataFrame({'Contract': contracts})
+        for c in grid_commodities:
+            display[c] = np.nan
+            if c not in power_df.index:
+                continue
+            cmap = contract_maps.get(c, {})
+            for mcol in power_df.columns:
+                if pd.isna(power_df.loc[c, mcol]):
+                    continue
+                ccode = cmap.get(mcol, mcol)
+                hit = display['Contract'] == ccode
+                if hit.any():
+                    display.loc[hit, c] = power_df.loc[c, mcol]
+
+        def _power_cell_style(val):
             if pd.isna(val):
-                return '#586069', ''
-            if val > 5:
-                return '#3fb950', 'font-weight:bold'
-            elif val > 0:
-                return '#56d364', ''
-            elif val > -5:
-                return '#f85149', ''
-            else:
-                return '#ff7b72', 'font-weight:bold'
+                return ''
+            v = float(val)
+            if v > 5:
+                return 'background-color: #1f4d2e; color: #e6edf3; font-weight: 600;'
+            if v > 0:
+                return 'background-color: #214e36; color: #e6edf3;'
+            if v > -5:
+                return 'background-color: #5a1f2a; color: #e6edf3;'
+            return 'background-color: #6b2330; color: #e6edf3; font-weight: 600;'
 
-        # Column headers with month codes if available
-        header_cells = '<th style="color:#8b949e;padding:6px 10px;text-align:left;border-bottom:2px solid #ff9500;border-right:1px solid #1e2530;"></th>'
-        for col in power_df.columns:
-            # Try to get the month code for this column from the first commodity that has it
-            code_label = ''
-            if len(month_codes_df) > 0:
-                for cidx in month_codes_df.index:
-                    if col in month_codes_df.columns:
-                        c_val = month_codes_df.loc[cidx, col]
-                        if pd.notna(c_val) and str(c_val) != '?':
-                            code_label = f'<br/><span style="color:#586069;font-size:10px;">{c_val}</span>'
-                            break
-            header_cells += f'<th style="color:#8b949e;padding:6px 10px;text-align:right;border-bottom:2px solid #ff9500;border-right:1px solid #1e2530;font-size:12px;">{col}{code_label}</th>'
-
-        html_rows = []
-        for commodity in power_df.index:
-            cells = f'<td style="color:#ff9500;font-weight:bold;padding:6px 10px;border-right:1px solid #1e2530;white-space:nowrap;">{commodity}</td>'
-            for col in power_df.columns:
-                val = power_df.loc[commodity, col] if col in power_df.columns else None
-                if pd.notna(val):
-                    color, style = _power_color(val)
-                    # Build tooltip with fwd vol, predicted RV, and month code
-                    fv = fwd_vols_df.loc[commodity, col] if col in fwd_vols_df.columns and pd.notna(fwd_vols_df.loc[commodity, col]) else None
-                    pr = pred_rvs_df.loc[commodity, col] if col in pred_rvs_df.columns and pd.notna(pred_rvs_df.loc[commodity, col]) else None
-                    mc = ''
-                    if len(month_codes_df) > 0 and col in month_codes_df.columns:
-                        mc_val = month_codes_df.loc[commodity, col] if commodity in month_codes_df.index else None
-                        mc = f" [{mc_val}]" if pd.notna(mc_val) else ""
-                    tip_parts = []
-                    if fv is not None:
-                        tip_parts.append(f"FV:{fv:.1f}")
-                    if pr is not None:
-                        tip_parts.append(f"RV:{pr:.1f}")
-                    tip_parts.append(mc.strip())
-                    tooltip = " | ".join([t for t in tip_parts if t])
-                    cells += f'<td style="color:{color};{style};padding:6px 10px;text-align:right;border-right:1px solid #1e2530;" title="{tooltip}">{val:+.1f}%</td>'
-                else:
-                    cells += f'<td style="color:#586069;padding:6px 10px;text-align:center;border-right:1px solid #1e2530;">—</td>'
-            html_rows.append(f'<tr style="border-bottom:1px solid #1e2530;">{cells}</tr>')
-
-        html_table = f"""
-        <div style="overflow-x:auto;">
-        <table style="width:100%;border-collapse:collapse;font-family:Consolas,Monaco,monospace;font-size:14px;background-color:#0f1419;border:1px solid #1e2530;">
-            <thead><tr>{header_cells}</tr></thead>
-            <tbody>{''.join(html_rows)}</tbody>
-        </table>
-        </div>
-        """
-        st.markdown(html_table, unsafe_allow_html=True)
+        value_cols = [c for c in grid_commodities if c in display.columns]
+        st.dataframe(
+            display.style.format({col: '{:+.1f}%' for col in value_cols}).applymap(_power_cell_style, subset=value_cols),
+            use_container_width=True,
+            hide_index=True,
+            height=min(520, 80 + 32 * len(display))
+        )
 
         st.markdown("")  # spacer
 
@@ -1025,84 +1145,169 @@ if active_tab == "DASHBOARD":
 # ============================================================================
 if active_tab == "VOL CHANGE":
     st.markdown('<div class="bloomberg-header"><span>VOL CHANGE</span></div>', unsafe_allow_html=True)
-    st.caption("1-day and selectable longer-term changes for IV (dirty vol) and Forward Vol")
+    st.caption("IV and Forward Vol change grids by contract and commodity")
 
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        long_window = st.selectbox(
-            "Longer-term lookback (trading days)",
-            list(range(1, 21)),
-            index=4,
-            key="vol_change_lookback"
-        )
-    with col_b:
-        max_months = st.selectbox(
-            "Max contract months",
-            [6, 8, 10, 12],
-            index=3,
-            key="vol_change_max_months"
-        )
+    long_window = st.selectbox("Lookback (trading days)", list(range(1, 21)), index=4, key="vol_change_lookback")
+    max_months = 12
 
-    vol_change_commodities = ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW']
-    long_lbl = f"{long_window}D"
-    long_col_lbl = long_lbl if long_window != 1 else "1D (selected)"
+    vol_change_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
+    def _contract_sort_key(code):
+        month_rank = {'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6, 'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12}
+        s = str(code) if pd.notna(code) else ""
+        if len(s) < 2:
+            return (9999, 99)
+        try:
+            yy = int(s[1:])
+        except Exception:
+            yy = 9999
+        return (yy, month_rank.get(s[0], 99))
 
-    for c in vol_change_commodities:
-        vol_chg, meta = build_vol_change_table(
-            df=df,
-            commodity=c,
-            selected_date=selected_date,
-            long_window=long_window,
-            max_months=max_months,
-            live_df=live_df
-        )
+    def _build_grid(window_days: int, metric_kind: str):
+        per_comm = {}
+        for c in vol_change_commodities:
+            t, _meta = build_vol_change_table(
+                df=df,
+                commodity=c,
+                selected_date=selected_date,
+                long_window=window_days,
+                max_months=max_months,
+                live_df=live_df,
+                master_df=master_base_df
+            )
+            if len(t) > 0:
+                per_comm[c] = t[['contract_code', 'iv_chg_1d', 'fwd_chg_1d', 'iv_chg_long', 'fwd_chg_long']].copy()
 
-        st.markdown(f"**{c}**")
-        if len(vol_chg) == 0:
-            st.warning(meta.get("error", f"No vol change data available for {c}"))
-            continue
+        if len(per_comm) == 0:
+            return pd.DataFrame()
 
-        current_date = meta.get("current_date")
-        prev_date = meta.get("prev_date")
-        long_date = meta.get("long_date")
+        contracts = set()
+        for t in per_comm.values():
+            contracts.update([str(x) for x in t['contract_code'].dropna().tolist()])
+        contracts = sorted(list(contracts), key=_contract_sort_key)
 
-        st.caption(
-            f"As of {pd.to_datetime(current_date).date()}  |  "
-            f"1D ref: {pd.to_datetime(prev_date).date() if prev_date is not None else 'N/A'}  |  "
-            f"{long_lbl} ref: {pd.to_datetime(long_date).date() if long_date is not None else 'N/A'}"
-        )
+        grid = pd.DataFrame({'Contract': contracts})
+        for c in vol_change_commodities:
+            grid[c] = np.nan
+            if c in per_comm:
+                t = per_comm[c].drop_duplicates(subset=['contract_code'], keep='first').set_index('contract_code')
+                if metric_kind == "IV":
+                    col = 'iv_chg_1d' if window_days == 1 else 'iv_chg_long'
+                else:
+                    col = 'fwd_chg_1d' if window_days == 1 else 'fwd_chg_long'
+                grid[c] = grid['Contract'].map(t[col]) if col in t.columns else np.nan
+        return grid
 
-        m1 = vol_chg[vol_chg['contract_month'] == 1]
-        if len(m1) > 0:
-            r = m1.iloc[0]
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.metric(f"{c} M1 IV 1D Δ", f"{r['iv_chg_1d']:+.2f}" if pd.notna(r['iv_chg_1d']) else "N/A")
-            with c2:
-                st.metric(f"{c} M1 IV {long_col_lbl} Δ", f"{r['iv_chg_long']:+.2f}" if pd.notna(r['iv_chg_long']) else "N/A")
-            with c3:
-                st.metric(f"{c} M1 FWD 1D Δ", f"{r['fwd_chg_1d']:+.2f}" if pd.notna(r['fwd_chg_1d']) else "N/A")
-            with c4:
-                st.metric(f"{c} M1 FWD {long_col_lbl} Δ", f"{r['fwd_chg_long']:+.2f}" if pd.notna(r['fwd_chg_long']) else "N/A")
+    def _delta_cell_style(val):
+        if pd.isna(val):
+            return ''
+        if isinstance(val, (int, float, np.floating, np.integer)):
+            if float(val) > 0:
+                return 'background-color: #1f4d2e; color: #e6edf3;'
+            if float(val) < 0:
+                return 'background-color: #5a1f2a; color: #e6edf3;'
+        return ''
 
-        table = vol_chg.copy()
-        table = table[['contract_code', 'iv_now', 'iv_chg_1d', 'iv_chg_long', 'fwd_now', 'fwd_chg_1d', 'fwd_chg_long']]
-        table.columns = ['Contract', 'IV Now', 'IV 1D Δ', f'IV {long_col_lbl} Δ', 'Fwd Now', 'Fwd 1D Δ', f'Fwd {long_col_lbl} Δ']
-
+    st.markdown("**1-Day IV Change**")
+    grid_1d_iv = _build_grid(window_days=1, metric_kind="IV")
+    if len(grid_1d_iv) == 0:
+        st.warning("No 1-day IV change data available.")
+    else:
+        delta_cols = [c for c in grid_1d_iv.columns if c != 'Contract']
         st.dataframe(
-            table.style.format({
-                'IV Now': '{:.3f}',
-                'IV 1D Δ': '{:+.3f}',
-                f'IV {long_col_lbl} Δ': '{:+.3f}',
-                'Fwd Now': '{:.3f}',
-                'Fwd 1D Δ': '{:+.3f}',
-                f'Fwd {long_col_lbl} Δ': '{:+.3f}',
-            }),
+            grid_1d_iv.style.format({col: '{:+.3f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
             use_container_width=True,
-            height=min(500, 80 + 35 * len(table)),
+            height=min(520, 80 + 32 * len(grid_1d_iv)),
             hide_index=True
         )
-        st.markdown("---")
+
+    st.markdown("**1-Day FWD Change**")
+    grid_1d_fwd = _build_grid(window_days=1, metric_kind="FWD")
+    if len(grid_1d_fwd) == 0:
+        st.warning("No 1-day FWD change data available.")
+    else:
+        delta_cols = [c for c in grid_1d_fwd.columns if c != 'Contract']
+        st.dataframe(
+            grid_1d_fwd.style.format({col: '{:+.3f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
+            use_container_width=True,
+            height=min(520, 80 + 32 * len(grid_1d_fwd)),
+            hide_index=True
+        )
+
+    st.markdown("---")
+
+    st.markdown(f"**{long_window}-Day IV Change**")
+    grid_nd_iv = _build_grid(window_days=long_window, metric_kind="IV")
+    if len(grid_nd_iv) == 0:
+        st.warning(f"No {long_window}-day IV change data available.")
+    else:
+        delta_cols = [c for c in grid_nd_iv.columns if c != 'Contract']
+        st.dataframe(
+            grid_nd_iv.style.format({col: '{:+.3f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
+            use_container_width=True,
+            height=min(520, 80 + 32 * len(grid_nd_iv)),
+            hide_index=True
+        )
+
+    st.markdown(f"**{long_window}-Day FWD Change**")
+    grid_nd_fwd = _build_grid(window_days=long_window, metric_kind="FWD")
+    if len(grid_nd_fwd) == 0:
+        st.warning(f"No {long_window}-day FWD change data available.")
+    else:
+        delta_cols = [c for c in grid_nd_fwd.columns if c != 'Contract']
+        st.dataframe(
+            grid_nd_fwd.style.format({col: '{:+.3f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
+            use_container_width=True,
+            height=min(520, 80 + 32 * len(grid_nd_fwd)),
+            hide_index=True
+        )
+
+# ============================================================================
+# TAB: TRADING CALENDAR
+# ============================================================================
+if active_tab == "TRADING CALENDAR":
+    st.subheader("Trading Calendar")
+    st.caption("US market holidays (2026) and available trading dates from loaded vol dataset")
+
+    holiday_rows = [
+        ("New Year's Day", "Thursday, January 1, 2026"),
+        ("Martin Luther King Jr. Day", "Monday, January 19, 2026"),
+        ("Washington's Birthday (Presidents' Day)", "Monday, February 16, 2026"),
+        ("Memorial Day", "Monday, May 25, 2026"),
+        ("Juneteenth National Independence Day", "Friday, June 19, 2026"),
+        ("Independence Day", "Saturday, July 4, 2026 (banks often observe Friday, July 3)"),
+        ("Labor Day", "Monday, September 7, 2026"),
+        ("Veterans Day", "Wednesday, November 11, 2026"),
+        ("Thanksgiving Day", "Thursday, November 26, 2026"),
+        ("Christmas Day", "Friday, December 25, 2026"),
+    ]
+    holiday_df = pd.DataFrame(holiday_rows, columns=["Holiday", "Date"])[["Date", "Holiday"]]
+    st.markdown("**US Holidays (2026)**")
+    st.dataframe(holiday_df, use_container_width=True, hide_index=True, height=260)
+    st.markdown("")
+
+    usda_rows = [
+        ("January 12, 2026", "WASDE"),
+        ("February 10, 2026", "WASDE"),
+        ("March 10, 2026", "WASDE"),
+        ("April 9, 2026", "WASDE"),
+        ("May 12, 2026", "WASDE"),
+        ("June 11, 2026", "WASDE"),
+        ("July 10, 2026", "WASDE"),
+        ("August 12, 2026", "WASDE"),
+        ("September 11, 2026", "WASDE"),
+        ("October 9, 2026", "WASDE"),
+        ("November 10, 2026", "WASDE"),
+        ("December 10, 2026", "WASDE"),
+        ("January 12, 2026", "Quarterly Grain Stocks"),
+        ("March 31, 2026", "Quarterly Grain Stocks"),
+        ("June 30, 2026", "Quarterly Grain Stocks"),
+        ("September 30, 2026", "Quarterly Grain Stocks"),
+    ]
+    usda_df = pd.DataFrame(usda_rows, columns=["Date", "Report"])
+    usda_df["__sort_date"] = pd.to_datetime(usda_df["Date"], errors="coerce")
+    usda_df = usda_df.sort_values(["__sort_date", "Report"]).drop(columns=["__sort_date"]).reset_index(drop=True)
+    st.markdown("**USDA Reports (WASDE 2026)**")
+    st.dataframe(usda_df, use_container_width=True, hide_index=True, height=380)
 
 # ============================================================================
 # TAB 2: TERM STRUCTURE
@@ -1253,14 +1458,62 @@ if active_tab == "SKEW":
         if isinstance(snap, pd.DataFrame) and len(snap) > 0:
             tmp = assign_contract_month_from_snapshot(snap, max_months=12)
             tmp['commodity'] = c
-            tmp['month_label'] = tmp['contract_month'].map(lambda x: f"M{int(x)}")
+            if 'contract_label' in tmp.columns:
+                tmp['contract_month_label'] = tmp['contract_label'].astype(str)
+            else:
+                tmp['contract_month_label'] = tmp['contract_month'].map(lambda x: f"M{int(x)}")
+            tmp['contract_month_label'] = tmp['contract_month_label'].replace({'nan': np.nan, 'None': np.nan})
+            tmp['contract_month_label'] = tmp['contract_month_label'].fillna(tmp['contract_month'].map(lambda x: f"M{int(x)}"))
+
+            # Current skew should come from live_vols when available, then subtract precomputed medians.
+            live_cur = pd.DataFrame()
+            if live_df is not None and len(live_df) > 0:
+                lsub = live_df[live_df['commodity'] == c].copy()
+                if len(lsub) > 0:
+                    lsub['date'] = pd.to_datetime(lsub['date'], errors='coerce')
+                    lsub = lsub[lsub['date'].notna() & (lsub['date'] <= selected_date)]
+                    if len(lsub) > 0:
+                        ldate = lsub['date'].max()
+                        live_cur = lsub[lsub['date'] == ldate].copy()
+
+            # Fallback to merged df current date if live is unavailable for this commodity.
+            if len(live_cur) == 0:
+                live_cur = df[(df['commodity'] == c) & (df['date'] == selected_date)].copy()
+
+            if len(live_cur) > 0:
+                live_cur = assign_contract_month_from_snapshot(live_cur, max_months=12)
+
+            skew_source_candidates = {
+                'P2': ['skew_m1.5', 'skew_neg15', 'P2'],
+                'P1': ['skew_m0.5', 'skew_neg05', 'P1'],
+                'C1': ['skew_p0.5', 'skew_pos05', 'C1'],
+                'C2': ['skew_p1.5', 'skew_pos15', 'C2'],
+                'C3': ['skew_p3.0', 'skew_pos3', 'C3'],
+            }
+
             for col in ['P2', 'P1', 'C1', 'C2', 'C3']:
                 med_col = f"{col}_hist_median"
-                if col in tmp.columns and med_col in tmp.columns:
-                    tmp[col] = pd.to_numeric(tmp[col], errors='coerce') - pd.to_numeric(tmp[med_col], errors='coerce')
-                else:
+                if med_col not in tmp.columns:
                     tmp[col] = np.nan
-            skew_rows.append(tmp[['commodity', 'contract_month', 'month_label', 'P2', 'P1', 'C1', 'C2', 'C3']])
+                    continue
+
+                cur_vals = pd.Series(np.nan, index=tmp.index)
+                if len(live_cur) > 0:
+                    src_col = None
+                    for cand in skew_source_candidates[col]:
+                        if cand in live_cur.columns:
+                            src_col = cand
+                            break
+                    if src_col is not None:
+                        cur_map = (
+                            live_cur[['contract_month', src_col]]
+                            .drop_duplicates(subset=['contract_month'], keep='first')
+                            .set_index('contract_month')[src_col]
+                        )
+                        cur_vals = tmp['contract_month'].map(cur_map)
+
+                tmp[col] = pd.to_numeric(cur_vals, errors='coerce') - pd.to_numeric(tmp[med_col], errors='coerce')
+            skew_rows.append(tmp[['commodity', 'contract_month', 'contract_month_label', 'P2', 'P1', 'C1', 'C2', 'C3']])
 
     if len(skew_rows) > 0:
         skew_grid = pd.concat(skew_rows, ignore_index=True)
@@ -1291,7 +1544,9 @@ if active_tab == "SKEW":
             if len(cdf) == 0:
                 continue
             st.markdown(f"**{c}**")
-            display = cdf[['month_label', 'P2', 'P1', 'C1', 'C2', 'C3']].set_index('month_label')
+            label_col = 'contract_month_label' if 'contract_month_label' in cdf.columns else 'month_label'
+            display = cdf[[label_col, 'P2', 'P1', 'C1', 'C2', 'C3']].set_index(label_col)
+            display.index.name = "Contract"
             st.dataframe(
                 display.style
                 .format('{:+.2f}')
@@ -1301,6 +1556,52 @@ if active_tab == "SKEW":
             )
 
 # ============================================================================
+# TAB: CORRELATIONS
+# ============================================================================
+if active_tab == "CORRELATIONS":
+    st.subheader("Cross-Commodity Correlations")
+
+    corr_df = load_correlation_data()
+    if corr_df is None or len(corr_df) == 0:
+        st.warning("Correlation data not available. Expected file: cache/correlation_matrices.csv")
+    else:
+        windows = sorted([int(w) for w in corr_df['window'].dropna().unique().tolist()])
+        if len(windows) == 0:
+            st.warning("No correlation windows found in cache/correlation_matrices.csv")
+        else:
+            default_idx = windows.index(20) if 20 in windows else 0
+            corr_window = st.selectbox(
+                "Correlation Window (days)",
+                windows,
+                index=default_idx,
+                key="correlation_window_days"
+            )
+
+            wdf = corr_df[corr_df['window'] == corr_window].copy()
+            if len(wdf) == 0:
+                st.warning(f"No rows for {corr_window}-day window.")
+            else:
+                matrix = wdf.pivot_table(
+                    index='commodity_1',
+                    columns='commodity_2',
+                    values='correlation',
+                    aggfunc='last'
+                )
+                order = ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW']
+                matrix = matrix.reindex(index=order, columns=order)
+                # Keep diagonal + upper triangle only (hide redundant mirrored values).
+                mask = np.triu(np.ones(matrix.shape, dtype=bool))
+                matrix = matrix.where(mask)
+
+                def blank_cell_gray(val):
+                    return 'background-color: #2d333b; color: #8b949e;' if pd.isna(val) else ''
+
+                st.dataframe(
+                    matrix.style.format('{:.3f}', na_rep='').applymap(blank_cell_gray),
+                    use_container_width=True,
+                    height=330
+                )
+
 # TAB: REALIZED VOL
 # ============================================================================
 if active_tab == "REALIZED VOL":
@@ -1463,13 +1764,24 @@ if active_tab == "VAR RATIOS":
 
 # Footer
 st.markdown("---")
+footer_left, footer_right = st.columns([1, 3])
+with footer_left:
+    if st.button("Refresh Live", key="refresh_live_bottom"):
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['python', 'scripts/xlsm_to_csv.py', '-o', 'data/live_vols.csv'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(f"Refresh failed: {result.stderr[-200:]}")
+        except Exception as e:
+            st.error(f"Refresh failed: {e}")
 _updates = get_source_update_timestamps()
-st.markdown(
-    f"""
-    <div style="font-family:Consolas,monospace;font-size:10px;color:#586069;text-align:right;line-height:1.5;">
-        vol data updated at: {_updates['master_vol_skew']}<br/>
-        price data updated at: {_updates['all_commodity_prices']}
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+with footer_right:
+    st.markdown(f"- Live data: `{_updates.get('live_data', 'unavailable')}`")
+    st.markdown(f"- Vol data: `{_updates.get('master_vol_skew', 'unavailable')}`")
+    st.markdown(f"- Price data: `{_updates.get('all_commodity_prices', 'unavailable')}`")
