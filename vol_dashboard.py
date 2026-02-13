@@ -10,6 +10,7 @@ import textwrap
 import os
 from lib import vol_analysis as va
 from lib import variance_ratios as vr
+from lib import price_analysis as pa
 from datetime import datetime, timedelta
 
 if "theme_mode" not in st.session_state:
@@ -93,6 +94,61 @@ def load_correlation_data():
 
 
 @st.cache_data(ttl=30)
+def load_median_iv_cache():
+    """Load precomputed median IV table if available."""
+    try:
+        if os.path.exists('cache/median_iv.csv'):
+            mdf = pd.read_csv('cache/median_iv.csv')
+            # Normalize expected columns
+            rename_map = {
+                'commodity': 'commodity',
+                'COMMODITY': 'commodity',
+                'FRONT_OPTIONS': 'front_options',
+                'front_options_month': 'front_options',
+                'OPTIONS': 'options_month',
+                'options_month': 'options_month',
+                'median_iv': 'median_iv',
+                'MEDIAN_IV': 'median_iv',
+            }
+            cols = {}
+            for c in mdf.columns:
+                if c in rename_map:
+                    cols[c] = rename_map[c]
+            mdf = mdf.rename(columns=cols)
+            required = {'commodity', 'front_options', 'options_month', 'median_iv'}
+            if not required.issubset(set(mdf.columns)):
+                return pd.DataFrame()
+            mdf['commodity'] = mdf['commodity'].astype(str).str.upper().str.strip()
+            mdf['front_options'] = mdf['front_options'].astype(str).str.upper().str.strip()
+            mdf['options_month'] = mdf['options_month'].astype(str).str.upper().str.strip()
+            mdf['median_iv'] = pd.to_numeric(mdf['median_iv'], errors='coerce')
+            return mdf[['commodity', 'front_options', 'options_month', 'median_iv']]
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def load_skew_percentile_dist_cache():
+    """Load precomputed skew percentile distribution table if available."""
+    try:
+        p = 'cache/skew_percentile_dist.csv'
+        if not os.path.exists(p):
+            return pd.DataFrame()
+        sdf = pd.read_csv(p)
+        if len(sdf) == 0:
+            return pd.DataFrame()
+        for c in ['commodity', 'FRONT_OPTIONS', 'OPTIONS']:
+            if c in sdf.columns:
+                sdf[c] = sdf[c].astype(str).str.upper().str.strip()
+        if 'commodity' in sdf.columns:
+            sdf['commodity'] = sdf['commodity'].astype(str).str.upper().str.strip()
+        return sdf
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
 def get_source_update_timestamps():
     """Return filesystem modified timestamps for primary source files."""
     def _fmt(path):
@@ -166,6 +222,41 @@ def assign_contract_month_from_snapshot(tmp: pd.DataFrame, max_months: int = 8) 
     return out
 
 
+MONTH_CODE_FALLBACK = {1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M', 7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'}
+
+
+def get_options_lookup_for_commodity(commodity: str) -> dict:
+    """Return expiry_month -> options month code mapping for a commodity."""
+    try:
+        m = va.load_options_mapping('data/mapping.csv')
+        sub = m[m['COMMODITY'] == str(commodity).upper()]
+        if len(sub) > 0 and 'EXPIRY_MONTH' in sub.columns:
+            return {
+                int(r['EXPIRY_MONTH']): str(r['OPTIONS']).upper()
+                for _, r in sub.iterrows()
+                if pd.notna(r.get('EXPIRY_MONTH', np.nan)) and pd.notna(r.get('OPTIONS', np.nan))
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def build_contract_labels_from_expiry(expiry_series: pd.Series, commodity: str) -> pd.Series:
+    """
+    Build contract code labels from expiry + commodity mapping, applying F-year convention.
+    Example: expiry 2026-12-24 -> F27.
+    """
+    exp = pd.to_datetime(expiry_series, errors='coerce')
+    lookup = get_options_lookup_for_commodity(commodity)
+    opt_code = exp.dt.month.map(
+        lambda m: lookup.get(int(m), MONTH_CODE_FALLBACK.get(int(m), '?')) if pd.notna(m) else '?'
+    )
+    contract_year = exp.dt.year + np.where(opt_code == 'F', 1, 0)
+    labels = opt_code.astype(str) + contract_year.mod(100).fillna(0).astype(int).astype(str).str.zfill(2)
+    labels = labels.replace({'nan': np.nan, 'None': np.nan, '?00': np.nan})
+    return labels
+
+
 def build_vol_change_table(
     df: pd.DataFrame,
     commodity: str,
@@ -232,33 +323,8 @@ def build_vol_change_table(
     current = current.sort_values(['contract_month', 'expiry']).drop_duplicates(subset=['expiry'], keep='first').head(max_months)
     current = current.rename(columns={'dirty_vol': 'iv_now', 'fwd_vol': 'fwd_now'})
 
-    # Build display contract code from expiry using commodity-specific OPTIONS mapping
-    # (prevents invalid labels like G for commodities that don't list it).
-    month_code = {1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M', 7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'}
-    options_lookup = {}
-    try:
-        m = va.load_options_mapping('data/mapping.csv')
-        sub = m[m['COMMODITY'] == str(commodity).upper()]
-        if len(sub) > 0 and 'EXPIRY_MONTH' in sub.columns:
-            options_lookup = {
-                int(r['EXPIRY_MONTH']): str(r['OPTIONS']).upper()
-                for _, r in sub.iterrows()
-                if pd.notna(r.get('EXPIRY_MONTH', np.nan)) and pd.notna(r.get('OPTIONS', np.nan))
-            }
-    except Exception:
-        options_lookup = {}
-
-    exp_dt = pd.to_datetime(current['expiry'], errors='coerce')
-    opt_code = exp_dt.dt.month.map(
-        lambda m: options_lookup.get(int(m), month_code.get(int(m), '?')) if pd.notna(m) else '?'
-    )
-    # Contract-year convention: F contracts are labeled with next calendar year.
-    # Example: 2026-12-24 expiry -> F27.
-    contract_year = exp_dt.dt.year + np.where(opt_code == 'F', 1, 0)
-    current['contract_code'] = (
-        opt_code.astype(str)
-        + contract_year.mod(100).fillna(0).astype(int).astype(str).str.zfill(2)
-    )
+    current['contract_code'] = build_contract_labels_from_expiry(current['expiry'], commodity)
+    current['contract_code'] = current['contract_code'].fillna(current['contract_month'].map(lambda x: f"M{int(x)}"))
 
     out = current[['contract_month', 'expiry', 'contract_code', 'iv_now', 'fwd_now']].copy()
 
@@ -505,17 +571,19 @@ if st.session_state.get("theme_mode", "Dark") == "Light":
 # Title
 st.markdown('<div class="bloomberg-header"><span>VOL TRADING DASHBOARD</span></div>', unsafe_allow_html=True)
 
-# Top navigation + global live controls
+# Top tab-style navigation + sidebar data controls
 NAV_SECTIONS = [
     "Vol Sheet",
     "Price Sheet",
     "Skew Analyzer",
     "IV Calendar",
+    "Spread Builder",
     "Trading Calendar",
     "Settings",
 ]
 default_section = st.session_state.get("active_section", "Vol Sheet")
-# Use full-width segmented control so all tabs stay on one line.
+
+# Keep main section navigation in top tab-style control.
 active_section = st.segmented_control(
     "Navigation",
     NAV_SECTIONS,
@@ -523,23 +591,36 @@ active_section = st.segmented_control(
     key="active_section",
     label_visibility="collapsed"
 )
+
+with st.sidebar:
+    with st.expander("Data Controls", expanded=True):
+        if st.button("Refresh Live", key="refresh_live_sidebar"):
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['python', 'scripts/xlsm_to_csv.py', '-o', 'data/live_vols.csv'],
+                    capture_output=True, text=True, timeout=60
+                )
+                if result.returncode == 0:
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(f"Refresh failed: {result.stderr[-200:]}")
+            except Exception as e:
+                st.error(f"Refresh failed: {e}")
+
+        _updates_top = get_source_update_timestamps()
+        st.caption(f"Live data updated at: {_updates_top.get('live_data', 'unavailable')}")
+        st.caption(f"Vol data updated at: {_updates_top.get('master_vol_skew', 'unavailable')}")
+        st.caption(f"Price data updated at: {_updates_top.get('all_commodity_prices', 'unavailable')}")
+
 if active_section is None:
     active_section = "Vol Sheet"
 
-if active_section not in ["Vol Sheet", "Price Sheet", "Skew Analyzer", "IV Calendar", "Trading Calendar", "Settings"]:
+if active_section not in ["Vol Sheet", "Price Sheet", "Skew Analyzer", "IV Calendar", "Spread Builder", "Trading Calendar", "Settings"]:
     st.markdown(f'<div class="bloomberg-header"><span>{active_section.upper()}</span></div>', unsafe_allow_html=True)
     st.info(f"{active_section} view is coming soon.")
     st.stop()
-
-# Top-of-page data timestamps (single row)
-_updates_top = get_source_update_timestamps()
-ts_cols = st.columns([1, 1, 1])
-with ts_cols[0]:
-    st.caption(f"Live: {_updates_top.get('live_data', 'unavailable')}")
-with ts_cols[1]:
-    st.caption(f"Vol: {_updates_top.get('master_vol_skew', 'unavailable')}")
-with ts_cols[2]:
-    st.caption(f"Prices: {_updates_top.get('all_commodity_prices', 'unavailable')}")
 
 if active_section == "Settings":
     st.markdown('<div class="bloomberg-header"><span>SETTINGS</span></div>', unsafe_allow_html=True)
@@ -551,13 +632,6 @@ if active_section == "Settings":
         st.session_state["theme_mode"] = selected_mode
         st.rerun()
     st.caption(f"Current mode: {selected_mode}")
-
-    st.markdown("---")
-    st.subheader("Data Timestamps")
-    _updates = get_source_update_timestamps()
-    st.markdown(f"- Live data: `{_updates.get('live_data', 'unavailable')}`")
-    st.markdown(f"- Vol data: `{_updates.get('master_vol_skew', 'unavailable')}`")
-    st.markdown(f"- Price data: `{_updates.get('all_commodity_prices', 'unavailable')}`")
     st.stop()
 
 # Load data
@@ -610,21 +684,17 @@ except Exception as e:
 if active_section == "Vol Sheet":
     tab_options = [
         "POWER GRID",
-        "IV %ILE",
-        "DASHBOARD",
-        "VOL CHANGE",
-        "TERM STRUCT",
-        "SPREADS",
-        "SKEW",
+        "VOL CHANGES",
+        "IV Percentiles",
     ]
     active_tab = st.radio("View", tab_options, horizontal=True, key="active_tab_vol")
     price_product = None
 elif active_section == "Price Sheet":
     st.markdown('<div class="bloomberg-header"><span>PRICE SHEET</span></div>', unsafe_allow_html=True)
     price_tab_options = [
-        "VAR RATIOS",
         "REALIZED VOL",
         "CORRELATIONS",
+        "VAR RATIOS",
     ]
     active_tab = st.radio("View", price_tab_options, horizontal=True, key="active_tab_price")
     price_product = None
@@ -641,7 +711,11 @@ elif active_section == "Skew Analyzer":
     price_product = None
 elif active_section == "IV Calendar":
     st.markdown('<div class="bloomberg-header"><span>IV CALENDAR</span></div>', unsafe_allow_html=True)
-    active_tab = "IV %ILE"
+    active_tab = "IV CALENDAR"
+    price_product = None
+elif active_section == "Spread Builder":
+    st.markdown('<div class="bloomberg-header"><span>SPREAD BUILDER</span></div>', unsafe_allow_html=True)
+    active_tab = "SPREAD BUILDER"
     price_product = None
 elif active_section == "Trading Calendar":
     st.markdown('<div class="bloomberg-header"><span>TRADING CALENDAR</span></div>', unsafe_allow_html=True)
@@ -751,19 +825,6 @@ if active_tab == "POWER GRID":
             day = df[(df['date'] == selected_date) & (df['commodity'] == comm)].sort_values('contract_month')
             if len(day) == 0:
                 return labels
-            lookup = {}
-            try:
-                m = va.load_options_mapping('data/mapping.csv')
-                sub = m[m['COMMODITY'] == str(comm).upper()]
-                if len(sub) > 0 and 'EXPIRY_MONTH' in sub.columns:
-                    lookup = {
-                        int(r['EXPIRY_MONTH']): str(r['OPTIONS']).upper()
-                        for _, r in sub.iterrows()
-                        if pd.notna(r.get('EXPIRY_MONTH', np.nan)) and pd.notna(r.get('OPTIONS', np.nan))
-                    }
-            except Exception:
-                lookup = {}
-            fallback = {1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M', 7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'}
             for _, r in day.iterrows():
                 cm = int(r['contract_month'])
                 if cm > max_grid_months:
@@ -771,9 +832,7 @@ if active_tab == "POWER GRID":
                 exp = pd.to_datetime(r.get('expiry', None), errors='coerce')
                 if pd.isna(exp):
                     continue
-                code = lookup.get(int(exp.month), fallback.get(int(exp.month), '?'))
-                year = int(exp.year) + (1 if code == 'F' else 0)
-                labels[f"M{cm}"] = f"{code}{str(year % 100).zfill(2)}"
+                labels[f"M{cm}"] = build_contract_labels_from_expiry(pd.Series([exp]), comm).iloc[0]
             return labels
 
         contract_maps = {c: _contract_labels_for_commodity(c) for c in grid_commodities}
@@ -824,51 +883,49 @@ if active_tab == "POWER GRID":
         # Expandable reference tables
         col_ref1, col_ref2 = st.columns(2)
 
+        def _matrix_to_contract_grid(src_df: pd.DataFrame) -> pd.DataFrame:
+            """Convert commodity x M# matrix to Contract x Commodity display."""
+            if src_df is None or len(src_df) == 0:
+                return pd.DataFrame()
+            out = pd.DataFrame({'Contract': contracts})
+            for c in grid_commodities:
+                out[c] = np.nan
+                if c not in src_df.index:
+                    continue
+                cmap = contract_maps.get(c, {})
+                for mcol in src_df.columns:
+                    v = src_df.loc[c, mcol] if mcol in src_df.columns else np.nan
+                    if pd.isna(v):
+                        continue
+                    ccode = cmap.get(mcol, mcol)
+                    hit = out['Contract'] == ccode
+                    if hit.any():
+                        out.loc[hit, c] = v
+            return out
+
         with col_ref1:
             with st.expander("FWD VOL MATRIX"):
                 if len(fwd_vols_df) > 0:
-                    fwd_html_rows = []
-                    for commodity in fwd_vols_df.index:
-                        cells = f'<td style="color:#ff9500;font-weight:bold;padding:4px 8px;border-right:1px solid #1e2530;">{commodity}</td>'
-                        for col in fwd_vols_df.columns:
-                            val = fwd_vols_df.loc[commodity, col] if col in fwd_vols_df.columns else None
-                            if pd.notna(val):
-                                cells += f'<td style="color:#c8cdd3;padding:4px 8px;text-align:right;border-right:1px solid #1e2530;">{val:.2f}</td>'
-                            else:
-                                cells += f'<td style="color:#586069;padding:4px 8px;text-align:center;border-right:1px solid #1e2530;">—</td>'
-                        fwd_html_rows.append(f'<tr style="border-bottom:1px solid #1e2530;">{cells}</tr>')
-                    fwd_header = '<th style="color:#8b949e;padding:4px 8px;border-bottom:1px solid #ff9500;border-right:1px solid #1e2530;"></th>'
-                    for col in fwd_vols_df.columns:
-                        fwd_header += f'<th style="color:#8b949e;padding:4px 8px;text-align:right;border-bottom:1px solid #ff9500;border-right:1px solid #1e2530;font-size:11px;">{col}</th>'
-                    st.markdown(f"""
-                    <table style="width:100%;border-collapse:collapse;font-family:Consolas,Monaco,monospace;font-size:13px;background-color:#0f1419;border:1px solid #1e2530;">
-                        <thead><tr>{fwd_header}</tr></thead>
-                        <tbody>{''.join(fwd_html_rows)}</tbody>
-                    </table>
-                    """, unsafe_allow_html=True)
+                    fwd_disp = _matrix_to_contract_grid(fwd_vols_df)
+                    fwd_cols = [c for c in grid_commodities if c in fwd_disp.columns]
+                    st.dataframe(
+                        fwd_disp.style.format({col: '{:.2f}' for col in fwd_cols}, na_rep='—'),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(420, 80 + 30 * len(fwd_disp))
+                    )
 
         with col_ref2:
             with st.expander("PREDICTED RV MATRIX"):
                 if len(pred_rvs_df) > 0:
-                    rv_html_rows = []
-                    for commodity in pred_rvs_df.index:
-                        cells = f'<td style="color:#ff9500;font-weight:bold;padding:4px 8px;border-right:1px solid #1e2530;">{commodity}</td>'
-                        for col in pred_rvs_df.columns:
-                            val = pred_rvs_df.loc[commodity, col] if col in pred_rvs_df.columns else None
-                            if pd.notna(val):
-                                cells += f'<td style="color:#c8cdd3;padding:4px 8px;text-align:right;border-right:1px solid #1e2530;">{val:.2f}</td>'
-                            else:
-                                cells += f'<td style="color:#586069;padding:4px 8px;text-align:center;border-right:1px solid #1e2530;">—</td>'
-                        rv_html_rows.append(f'<tr style="border-bottom:1px solid #1e2530;">{cells}</tr>')
-                    rv_header = '<th style="color:#8b949e;padding:4px 8px;border-bottom:1px solid #ff9500;border-right:1px solid #1e2530;"></th>'
-                    for col in pred_rvs_df.columns:
-                        rv_header += f'<th style="color:#8b949e;padding:4px 8px;text-align:right;border-bottom:1px solid #ff9500;border-right:1px solid #1e2530;font-size:11px;">{col}</th>'
-                    st.markdown(f"""
-                    <table style="width:100%;border-collapse:collapse;font-family:Consolas,Monaco,monospace;font-size:13px;background-color:#0f1419;border:1px solid #1e2530;">
-                        <thead><tr>{rv_header}</tr></thead>
-                        <tbody>{''.join(rv_html_rows)}</tbody>
-                    </table>
-                    """, unsafe_allow_html=True)
+                    rv_disp = _matrix_to_contract_grid(pred_rvs_df)
+                    rv_cols = [c for c in grid_commodities if c in rv_disp.columns]
+                    st.dataframe(
+                        rv_disp.style.format({col: '{:.2f}' for col in rv_cols}, na_rep='—'),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(420, 80 + 30 * len(rv_disp))
+                    )
 
         # Legend
         st.markdown("""
@@ -884,132 +941,497 @@ if active_tab == "POWER GRID":
         st.warning(f"No forward vol data available for {selected_date.date()}")
 
 # ============================================================================
+# TAB: IV CALENDAR
+# ============================================================================
+if active_tab == "IV CALENDAR":
+    cal_commodity = st.selectbox(
+        "Product",
+        ['SOY', 'MEAL', 'SM-S', 'CORN', 'WHEAT', 'KW', 'OIL'],
+        index=0,
+        key="iv_cal_commodity"
+    )
+
+    # Use master_df (full history, not just lookback) for seasonal averages
+    if cal_commodity == 'SM-S':
+        avg_meal, med_meal = va.compute_iv_calendar_grid(master_df, 'MEAL')
+        avg_soy, med_soy = va.compute_iv_calendar_grid(master_df, 'SOY')
+        # Align columns: use intersection of both
+        shared_cols = [c for c in avg_meal.columns if c in avg_soy.columns]
+        avg_grid = avg_meal[shared_cols] - avg_soy[shared_cols]
+        med_grid = med_meal[shared_cols] - med_soy[shared_cols]
+    else:
+        avg_grid, med_grid = va.compute_iv_calendar_grid(master_df, cal_commodity)
+
+    if len(avg_grid) == 0:
+        st.warning(f"No IV calendar data available for {cal_commodity}.")
+    else:
+        # Determine current time period for highlighting
+        current_tp = va._date_to_time_period(selected_date)
+
+        # Determine current front month for header
+        if cal_commodity == 'SM-S':
+            front_label = current_front_options_month('MEAL', selected_date)
+            st.caption(f"MEAL minus SOY seasonal dirty vol spread  |  Front: {front_label}  |  Current period: {current_tp}")
+        else:
+            front_label = current_front_options_month(cal_commodity, selected_date)
+            st.caption(f"Seasonal dirty vol by ~10-day period  |  Front: {front_label}  |  Current period: {current_tp}")
+        value_cols = list(avg_grid.columns)
+
+        def _iv_cal_row_highlight(row, current_period):
+            """Highlight the current time period row."""
+            if row.name == current_period:
+                return ['background-color: #1a2332; font-weight: 600;'] * len(row)
+            return [''] * len(row)
+
+        # ---- CURRENT vs MEDIAN (top) ----
+        # Helper to get current IV series for a commodity
+        def _get_current_iv(commodity_name):
+            cdata = df[
+                (df['date'] == selected_date) & (df['commodity'] == commodity_name)
+            ].copy()
+            if len(cdata) == 0:
+                return pd.Series(dtype=float)
+            cdata['expiry'] = pd.to_datetime(cdata['expiry'], errors='coerce')
+            _mapping = va.load_options_mapping()
+            _em_sub = _mapping[_mapping['COMMODITY'] == commodity_name.upper()]
+            _em_to_opt = {
+                int(r['EXPIRY_MONTH']): r['OPTIONS']
+                for _, r in _em_sub.iterrows()
+                if pd.notna(r.get('EXPIRY_MONTH'))
+            }
+            cdata['options_code'] = cdata['expiry'].dt.month.map(_em_to_opt)
+            cdata = cdata.dropna(subset=['options_code', 'dirty_vol'])
+            if len(cdata) == 0:
+                return pd.Series(dtype=float)
+            cdata = cdata.sort_values('expiry').drop_duplicates(subset=['options_code'], keep='first')
+            return cdata.set_index('options_code')['dirty_vol']
+
+        if cal_commodity == 'SM-S':
+            meal_iv = _get_current_iv('MEAL')
+            soy_iv = _get_current_iv('SOY')
+            shared = [c for c in meal_iv.index if c in soy_iv.index]
+            current_iv = meal_iv[shared] - soy_iv[shared] if shared else pd.Series(dtype=float)
+        else:
+            current_iv = _get_current_iv(cal_commodity)
+
+        if len(current_iv) > 0 and current_tp in med_grid.index:
+            # Build heat map row: current IV - median for current period
+            med_row = med_grid.loc[current_tp]
+            heat_vals = {}
+            for code in value_cols:
+                if code in current_iv.index and pd.notna(med_row.get(code)):
+                    heat_vals[code] = float(current_iv[code]) - float(med_row[code])
+                else:
+                    heat_vals[code] = np.nan
+
+            heat_df = pd.DataFrame([heat_vals], index=[current_tp])
+            heat_df.index.name = 'Period'
+
+            def _heat_cell_style(val):
+                if pd.isna(val):
+                    return ''
+                v = float(val)
+                if v > 2:
+                    return 'background-color: #1f4d2e; color: #e6edf3; font-weight: 600;'
+                if v > 0:
+                    return 'background-color: #214e36; color: #e6edf3;'
+                if v > -2:
+                    return 'background-color: #5a1f2a; color: #e6edf3;'
+                return 'background-color: #6b2330; color: #e6edf3; font-weight: 600;'
+
+            st.markdown("**CURRENT vs MEDIAN** (positive = above seasonal)")
+            st.dataframe(
+                heat_df.style
+                    .format({col: '{:+.2f}' for col in value_cols}, na_rep='—')
+                    .applymap(_heat_cell_style, subset=value_cols),
+                use_container_width=True,
+                hide_index=False
+            )
+
+        st.markdown("")  # spacer
+
+        # ---- MEDIAN grid ----
+        st.markdown("**MEDIAN**")
+        med_display = med_grid.copy()
+        med_display.index.name = 'Period'
+        st.dataframe(
+            med_display.style
+                .format({col: '{:.2f}' for col in value_cols}, na_rep='—')
+                .apply(_iv_cal_row_highlight, current_period=current_tp, axis=1),
+            use_container_width=True,
+            height=min(900, 80 + 28 * len(med_display))
+        )
+
+        st.markdown("")  # spacer
+
+        # ---- AVERAGE grid ----
+        st.markdown("**AVERAGE**")
+        avg_display = avg_grid.copy()
+        avg_display.index.name = 'Period'
+        st.dataframe(
+            avg_display.style
+                .format({col: '{:.2f}' for col in value_cols}, na_rep='—')
+                .apply(_iv_cal_row_highlight, current_period=current_tp, axis=1),
+            use_container_width=True,
+            height=min(900, 80 + 28 * len(avg_display))
+        )
+
+# ============================================================================
+# TAB: SPREAD BUILDER
+# ============================================================================
+if active_tab == "SPREAD BUILDER":
+    # Reserve top area so current spread/IV metrics can render above controls.
+    top_metrics_container = st.container()
+
+    sb_col1, sb_col2, sb_col3 = st.columns(3)
+    with sb_col1:
+        sb_commodity = st.selectbox(
+            "Commodity",
+            ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW'],
+            index=0,
+            key="sb_commodity"
+        )
+    _all_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+    with sb_col2:
+        sb_month1 = st.selectbox("Month 1", _all_codes, index=3, key="sb_month1")  # default J
+    with sb_col3:
+        sb_month2 = st.selectbox("Month 2", _all_codes, index=4, key="sb_month2")  # default K
+
+    # Normalize toggle + range input
+    norm_col1, norm_col2 = st.columns([1, 3])
+    with norm_col1:
+        sb_normalize = st.toggle("Normalize", value=False, key="sb_normalize")
+    with norm_col2:
+        sb_norm_range = st.number_input(
+            "+/- Range", min_value=0.1, max_value=50.0, value=2.5, step=0.5,
+            key="sb_norm_range", disabled=not sb_normalize)
+
+    if sb_month1 == sb_month2:
+        st.warning("Month 1 and Month 2 must be different.")
+    else:
+        sb_summary, sb_detail = va.compute_spread_builder(
+            master_df, sb_commodity, sb_month1, sb_month2)
+
+        if len(sb_summary) == 0:
+            st.warning(f"No spread data for {sb_commodity} {sb_month1}-{sb_month2}.")
+        else:
+            # Current period
+            current_tp = va._date_to_time_period(selected_date)
+
+            # Current spread from live_vols (fallback to merged df snapshot if needed).
+            def _get_current_vol(source_df, commodity_name, month_code, asof_date):
+                cdata = source_df[
+                    (source_df['date'] == asof_date) & (source_df['commodity'] == commodity_name)
+                ].copy()
+                if len(cdata) == 0:
+                    return np.nan
+                cdata['expiry'] = pd.to_datetime(cdata['expiry'], errors='coerce')
+                _mapping = va.load_options_mapping()
+                _em_sub = _mapping[_mapping['COMMODITY'] == commodity_name.upper()]
+                _em_to_opt = {
+                    int(r['EXPIRY_MONTH']): r['OPTIONS']
+                    for _, r in _em_sub.iterrows()
+                    if pd.notna(r.get('EXPIRY_MONTH'))
+                }
+                cdata['options_code'] = cdata['expiry'].dt.month.map(_em_to_opt)
+                cdata = cdata.dropna(subset=['options_code', 'dirty_vol'])
+                cdata = cdata.sort_values('expiry').drop_duplicates(
+                    subset=['options_code'], keep='first')
+                match = cdata[cdata['options_code'] == month_code]
+                return float(match.iloc[0]['dirty_vol']) if len(match) > 0 else np.nan
+
+            live_asof = pd.NaT
+            merged_asof = pd.NaT
+            current_v1 = np.nan
+            current_v2 = np.nan
+            spread_source = "live_vols"
+            if live_df is not None and len(live_df) > 0:
+                live_sub = live_df[live_df['commodity'] == sb_commodity].copy()
+                live_sub['date'] = pd.to_datetime(live_sub['date'], errors='coerce')
+                live_sub = live_sub[live_sub['date'].notna()]
+                if len(live_sub) > 0:
+                    live_le = live_sub[live_sub['date'] <= selected_date]
+                    live_asof = live_le['date'].max() if len(live_le) > 0 else live_sub['date'].max()
+                    current_v1 = _get_current_vol(live_sub, sb_commodity, sb_month1, live_asof)
+                    current_v2 = _get_current_vol(live_sub, sb_commodity, sb_month2, live_asof)
+
+            # Fallback if live did not have both legs.
+            if not (pd.notna(current_v1) and pd.notna(current_v2)):
+                spread_source = "snapshot fallback"
+                merged_sub = df[df['commodity'] == sb_commodity].copy()
+                merged_sub['date'] = pd.to_datetime(merged_sub['date'], errors='coerce')
+                merged_sub = merged_sub[merged_sub['date'].notna()]
+                if len(merged_sub) > 0:
+                    merged_le = merged_sub[merged_sub['date'] <= selected_date]
+                    merged_asof = merged_le['date'].max() if len(merged_le) > 0 else merged_sub['date'].max()
+                    current_v1 = _get_current_vol(merged_sub, sb_commodity, sb_month1, merged_asof)
+                    current_v2 = _get_current_vol(merged_sub, sb_commodity, sb_month2, merged_asof)
+
+            current_spread = current_v1 - current_v2 if pd.notna(current_v1) and pd.notna(current_v2) else np.nan
+
+            # Apply normalize filter: keep only obs where vol_1 is within current_v1 +/- range
+            if sb_normalize and pd.notna(current_v1):
+                vol_lo = current_v1 - sb_norm_range
+                vol_hi = current_v1 + sb_norm_range
+                sb_detail = sb_detail[
+                    (sb_detail['vol_1'] >= vol_lo) & (sb_detail['vol_1'] <= vol_hi)
+                ].copy()
+                # Recompute summary from filtered detail
+                if len(sb_detail) > 0:
+                    sb_summary = sb_detail.groupby('time_period')['spread'].agg(
+                        low='min', median='median', average='mean', high='max', count='count'
+                    ).reset_index()
+                    sb_summary['time_period'] = pd.Categorical(
+                        sb_summary['time_period'],
+                        categories=va._TIME_PERIOD_ORDER, ordered=True)
+                    sb_summary = sb_summary.sort_values('time_period').reset_index(drop=True)
+                else:
+                    sb_summary = pd.DataFrame(columns=['time_period', 'low', 'median', 'average', 'high', 'count'])
+
+            # Percentile of current spread within current period
+            if pd.notna(current_spread) and len(sb_summary) > 0 and current_tp in sb_summary['time_period'].values:
+                tp_detail = sb_detail[sb_detail['time_period'] == current_tp]
+                if len(tp_detail) > 0:
+                    pct = (tp_detail['spread'] <= current_spread).mean() * 100.0
+                else:
+                    pct = np.nan
+            else:
+                pct = np.nan
+
+            # Top box above the grid: current spread from live_vols.
+            source_asof = live_asof if spread_source == "live_vols" else merged_asof
+            source_asof_txt = pd.to_datetime(source_asof).strftime('%Y-%m-%d') if pd.notna(source_asof) else "n/a"
+            with top_metrics_container:
+                box_col1, box_col2, box_col3 = st.columns([1.2, 1, 1])
+                with box_col1:
+                    st.metric(
+                        f"Current Spread ({sb_month1}-{sb_month2})",
+                        f"{current_spread:+.2f}" if pd.notna(current_spread) else "—",
+                        delta=(f"{pct:.0f}th %ile ({current_tp})" if pd.notna(pct) else None)
+                    )
+                with box_col2:
+                    st.metric(f"{sb_month1} IV", f"{current_v1:.2f}" if pd.notna(current_v1) else "—")
+                with box_col3:
+                    st.metric(f"{sb_month2} IV", f"{current_v2:.2f}" if pd.notna(current_v2) else "—")
+                caption_parts = [f"Source: `{spread_source}` | As of: `{source_asof_txt}`"]
+                if sb_normalize and pd.notna(current_v1):
+                    caption_parts.append(
+                        f"| **Normalized**: {sb_month1} IV {current_v1 - sb_norm_range:.1f} – {current_v1 + sb_norm_range:.1f} ({len(sb_detail)} obs)")
+                st.caption("  ".join(caption_parts))
+
+            # Header info
+            info_parts = [f"**{sb_commodity} {sb_month1}-{sb_month2}**"]
+            if pd.notna(current_v1):
+                info_parts.append(f"{sb_month1}: {current_v1:.2f}")
+            if pd.notna(current_v2):
+                info_parts.append(f"{sb_month2}: {current_v2:.2f}")
+            if pd.notna(current_spread):
+                info_parts.append(f"Spread: {current_spread:+.2f}")
+            if pd.notna(pct):
+                info_parts.append(f"Percentile ({current_tp}): {pct:.1f}%")
+            st.markdown("  |  ".join(info_parts))
+
+            # ---- SUMMARY GRID ----
+            if len(sb_detail) == 0:
+                st.warning("No observations match the normalize filter. Try widening the range.")
+            st.markdown("**SUMMARY BY PERIOD**")
+            summary_display = sb_summary.copy()
+            summary_display['time_period'] = summary_display['time_period'].astype(str)
+            summary_display = summary_display.set_index('time_period')
+
+            def _sb_row_highlight(row, current_period):
+                if row.name == current_period:
+                    return ['background-color: #1a2332; font-weight: 600;'] * len(row)
+                return [''] * len(row)
+
+            fmt = {'low': '{:+.2f}', 'median': '{:+.3f}', 'average': '{:+.3f}',
+                   'high': '{:+.2f}', 'count': '{:.0f}'}
+            st.dataframe(
+                summary_display.style
+                    .format(fmt, na_rep='—')
+                    .apply(_sb_row_highlight, current_period=current_tp, axis=1),
+                use_container_width=True,
+                height=min(900, 80 + 28 * len(summary_display))
+            )
+
+            # ---- DETAIL TABLE (expandable) ----
+            def _spread_cell_style(val):
+                if pd.isna(val):
+                    return ''
+                v = float(val)
+                if v > 1:
+                    return 'background-color: #1f4d2e; color: #e6edf3;'
+                if v > 0:
+                    return 'background-color: #214e36; color: #e6edf3;'
+                if v > -1:
+                    return 'background-color: #5a1f2a; color: #e6edf3;'
+                return 'background-color: #6b2330; color: #e6edf3;'
+
+            # Filter to current + adjacent periods
+            nearby_idx = va._TIME_PERIOD_ORDER.index(current_tp) if current_tp in va._TIME_PERIOD_ORDER else 0
+            nearby_periods = set()
+            for offset in [-1, 0, 1]:
+                idx = nearby_idx + offset
+                if 0 <= idx < len(va._TIME_PERIOD_ORDER):
+                    nearby_periods.add(va._TIME_PERIOD_ORDER[idx])
+
+            with st.expander(f"DETAIL: all observations near {current_tp} ({len(nearby_periods)} periods)"):
+                detail_nearby = sb_detail[sb_detail['time_period'].isin(nearby_periods)].copy()
+                if len(detail_nearby) == 0:
+                    st.info("No observations in nearby periods.")
+                else:
+                    detail_nearby = detail_nearby.sort_values('vol_1', ascending=False)
+                    detail_display = detail_nearby[['date', 'time_period', 'vol_1', 'vol_2', 'spread']].copy()
+                    detail_display['date'] = pd.to_datetime(detail_display['date']).dt.strftime('%Y-%m-%d')
+                    detail_display = detail_display.reset_index(drop=True)
+
+                    st.dataframe(
+                        detail_display.style
+                            .format({'vol_1': '{:.2f}', 'vol_2': '{:.2f}', 'spread': '{:+.2f}'}, na_rep='—')
+                            .applymap(_spread_cell_style, subset=['spread']),
+                        use_container_width=True,
+                        height=min(600, 80 + 28 * len(detail_display)),
+                        hide_index=True
+                    )
+                    st.caption(f"{len(detail_display)} observations  |  Sorted by {sb_month1} vol descending")
+
+            with st.expander("DETAIL: all observations (all periods)"):
+                if len(sb_detail) == 0:
+                    st.info("No observations.")
+                else:
+                    all_display = sb_detail[['date', 'time_period', 'vol_1', 'vol_2', 'spread']].copy()
+                    all_display['date'] = pd.to_datetime(all_display['date']).dt.strftime('%Y-%m-%d')
+                    all_display = all_display.reset_index(drop=True)
+
+                    st.dataframe(
+                        all_display.style
+                            .format({'vol_1': '{:.2f}', 'vol_2': '{:.2f}', 'spread': '{:+.2f}'}, na_rep='—')
+                            .applymap(_spread_cell_style, subset=['spread']),
+                        use_container_width=True,
+                        height=min(600, 80 + 28 * min(len(all_display), 20)),
+                        hide_index=True
+                    )
+                    st.caption(f"{len(all_display)} observations  |  Sorted by {sb_month1} vol descending")
+
+# ============================================================================
 # TAB: IV PERCENTILE BATTERY
 # ============================================================================
-if active_tab == "IV %ILE":
+if active_tab in ["IV %ILE", "IV Percentiles"]:
     st.markdown('<div class="bloomberg-header"><span>IV PERCENTILE RANK</span></div>', unsafe_allow_html=True)
 
     # Display order: SOY, MEAL, CORN, WHEAT, KW, OIL
     pct_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
     pct_max_months = 12
 
-    # Calculate percentiles; if live data exists, use df/master (with live overlay) to ensure current dirty_vol drives the percentile.
+    # Calculate percentiles: always use precomputed snapshots for median and percentile.
+    # When live data exists, overlay live current IV and recompute percentile from
+    # the distribution CSV so that the live value is ranked correctly.
     lookback_years = lookback_years_from_days(lookback)
     pct_rows = []
-
     use_live = live_df is not None and not live_df.empty
 
-    if use_live:
+    for c in pct_commodities:
+        front_opt = current_front_options_month(c, selected_date)
+        snap, _meta = load_iv_snapshot_cached(c, front_opt, lookback_years)
+        if isinstance(snap, pd.DataFrame) and len(snap) > 0:
+            tmp = assign_contract_month_from_snapshot(snap, max_months=pct_max_months)
+            tmp['commodity'] = c
+            # Month labels
+            if 'expiry' in tmp.columns:
+                tmp['month_label'] = build_contract_labels_from_expiry(tmp['expiry'], c)
+            elif 'contract_code' in tmp.columns:
+                tmp['month_label'] = tmp['contract_code'].astype(str)
+            elif 'options_month' in tmp.columns:
+                tmp['month_label'] = tmp['options_month'].astype(str)
+            else:
+                tmp['month_label'] = tmp['contract_month'].map(lambda x: f"M{int(x)}")
+            tmp['month_label'] = tmp['month_label'].replace({'nan': np.nan, 'None': np.nan, '?00': np.nan})
+            tmp['month_label'] = tmp['month_label'].fillna(tmp['contract_month'].map(lambda x: f"M{int(x)}"))
+            tmp['current'] = pd.to_numeric(tmp.get('atm_iv', np.nan), errors='coerce')
+            tmp['median'] = pd.to_numeric(tmp.get('iv_hist_median', np.nan), errors='coerce')
+            p = pd.to_numeric(tmp.get('iv_percentile', np.nan), errors='coerce')
+            tmp['percentile'] = np.where(p <= 1, p * 100.0, p)
+
+            # Prefer median IV from cache/median_iv.csv keyed by commodity + front month + options month.
+            median_cache = load_median_iv_cache()
+            if len(median_cache) > 0 and 'options_month' in tmp.columns:
+                med_sub = median_cache[
+                    (median_cache['commodity'] == c.upper()) &
+                    (median_cache['front_options'] == str(front_opt).upper())
+                ][['options_month', 'median_iv']].drop_duplicates(subset=['options_month'], keep='last')
+                if len(med_sub) > 0:
+                    med_map = med_sub.set_index('options_month')['median_iv']
+                    tmp['median_cache'] = tmp['options_month'].astype(str).str.upper().map(med_map)
+                    tmp['median'] = np.where(tmp['median_cache'].notna(), tmp['median_cache'], tmp['median'])
+
+            # If live data present, overlay live dirty_vol as current and recompute percentile
+            if use_live and 'options_month' in tmp.columns:
+                from scripts import iv_percentiles_precompute as ivp
+                live_sub = live_df[live_df['commodity'] == c].copy()
+                if len(live_sub) > 0:
+                    live_sub = live_sub.sort_values('expiry' if 'expiry' in live_sub.columns else 'date')
+                    live_sub['_em'] = pd.to_datetime(live_sub['expiry'], errors='coerce').dt.month
+                    mapping_df = ivp.load_mapping()
+                    em_lookup = mapping_df[mapping_df['COMMODITY'] == c.upper()].set_index('EXPIRY_MONTH')['OPTIONS'].to_dict()
+                    live_sub['_opt'] = live_sub['_em'].map(em_lookup)
+                    for idx, row in tmp.iterrows():
+                        om = row.get('options_month', None)
+                        if om is None:
+                            continue
+                        live_match = live_sub[live_sub['_opt'] == om]
+                        if len(live_match) > 0:
+                            live_iv = pd.to_numeric(live_match.iloc[0].get('dirty_vol', np.nan), errors='coerce')
+                            if pd.notna(live_iv) and 0 < live_iv <= 200:
+                                tmp.at[idx, 'current'] = live_iv
+                                # Recompute percentile from distribution CSV
+                                result = ivp.lookup_iv_percentile(live_iv, c, front_opt, om)
+                                if result.get('percentile') is not None:
+                                    tmp.at[idx, 'percentile'] = result['percentile'] * 100.0
+
+            keep_cols = ['commodity', 'contract_month', 'month_label', 'current', 'percentile', 'median']
+            if 'options_month' in tmp.columns:
+                keep_cols.append('options_month')
+            pct_rows.append(tmp[keep_cols])
+
+    if len(pct_rows) > 0:
+        pct_grid = pd.concat(pct_rows, ignore_index=True)
+    else:
         pct_grid = va.get_percentile_grid_cached(
             df, selected_date, metric='dirty_vol',
             lookback_days=lookback, commodities=pct_commodities,
             max_months=pct_max_months, hist_df=master_hist
         )
-    else:
-        for c in pct_commodities:
-            front_opt = current_front_options_month(c, selected_date)
-            snap, _meta = load_iv_snapshot_cached(c, front_opt, lookback_years)
-            if isinstance(snap, pd.DataFrame) and len(snap) > 0:
-                tmp = assign_contract_month_from_snapshot(snap, max_months=pct_max_months)
-                tmp['commodity'] = c
-                # Prefer contract code, then options_month, then expiry, else M#
-                if 'contract_code' in tmp.columns:
-                    tmp['month_label'] = tmp['contract_code'].astype(str)
-                elif 'options_month' in tmp.columns:
-                    tmp['month_label'] = tmp['options_month'].astype(str)
-                elif 'expiry' in tmp.columns:
-                    tmp['month_label'] = pd.to_datetime(tmp['expiry'], errors='coerce').dt.strftime('%b%y')
-                else:
-                    tmp['month_label'] = tmp['contract_month'].map(lambda x: f"M{int(x)}")
-                tmp['current'] = pd.to_numeric(tmp.get('atm_iv', np.nan), errors='coerce')
-                tmp['median'] = pd.to_numeric(tmp.get('iv_hist_median', np.nan), errors='coerce')
-                p = pd.to_numeric(tmp.get('iv_percentile', np.nan), errors='coerce')
-                tmp['percentile'] = np.where(p <= 1, p * 100.0, p)
-                pct_rows.append(tmp[['commodity', 'contract_month', 'month_label', 'current', 'percentile', 'median']])
-
-        if len(pct_rows) > 0:
-            pct_grid = pd.concat(pct_rows, ignore_index=True)
-        else:
-            pct_grid = va.get_percentile_grid_cached(
-                df, selected_date, metric='dirty_vol',
-                lookback_days=lookback, commodities=pct_commodities,
-                max_months=pct_max_months, hist_df=master_hist
-            )
 
     # Ensure month labels exist
     if len(pct_grid) > 0:
         if 'month_label' not in pct_grid.columns or pct_grid['month_label'].isna().all():
-            if 'contract_code' in pct_grid.columns:
+            if 'expiry' in pct_grid.columns:
+                def _mk_label_row(r):
+                    try:
+                        return build_contract_labels_from_expiry(pd.Series([r.get('expiry')]), str(r.get('commodity', 'SOY'))).iloc[0]
+                    except Exception:
+                        return np.nan
+                pct_grid['month_label'] = pct_grid.apply(_mk_label_row, axis=1)
+            elif 'contract_code' in pct_grid.columns:
                 pct_grid['month_label'] = pct_grid['contract_code'].astype(str)
             elif 'options_month' in pct_grid.columns:
                 pct_grid['month_label'] = pct_grid['options_month'].astype(str)
-            elif 'expiry' in pct_grid.columns:
-                pct_grid['month_label'] = pd.to_datetime(pct_grid['expiry'], errors='coerce').dt.strftime('%b%y')
             else:
                 pct_grid['month_label'] = pct_grid['contract_month'].map(lambda x: f"M{int(x)}")
 
-    # Recompute percentiles using live dirty_vol rounded to nearest 0.05% where possible
+    # Round current IV to nearest 0.05%
     def _round_to_005(val):
         try:
             return np.round(float(val) * 20.0) / 20.0
         except Exception:
             return np.nan
 
-    def _percentile_from_hist(row):
-        if master_df is None or len(master_df) == 0:
-            return row.get('percentile', np.nan)
-        if 'dirty_vol' not in master_df.columns:
-            return row.get('percentile', np.nan)
-        filt = (master_df['commodity'] == row['commodity'])
-        if 'contract_month' in master_df.columns:
-            filt = filt & (master_df['contract_month'] == row['contract_month'])
-        vals = master_df.loc[filt, 'dirty_vol'].dropna()
-        if len(vals) == 0:
-            return row.get('percentile', np.nan)
-        v = _round_to_005(row.get('current', np.nan))
-        if pd.isna(v):
-            return row.get('percentile', np.nan)
-        sorted_vals = np.sort(vals.values.astype(float))
-        pos = np.searchsorted(sorted_vals, v, side='right')
-        pct = (pos / len(sorted_vals)) * 100.0
-        return pct
-
-    def _median_from_hist(row):
-        if master_df is None or len(master_df) == 0:
-            return row.get('median', np.nan)
-        if 'dirty_vol' not in master_df.columns:
-            return row.get('median', np.nan)
-        filt = (master_df['commodity'] == row['commodity'])
-        if 'contract_month' in master_df.columns:
-            filt = filt & (master_df['contract_month'] == row['contract_month'])
-        vals = master_df.loc[filt, 'dirty_vol'].dropna()
-        if len(vals) == 0:
-            return row.get('median', np.nan)
-        sorted_vals = np.sort(vals.values.astype(float))
-        return np.percentile(sorted_vals, 50)
-
     if len(pct_grid) > 0:
         pct_grid['current'] = pct_grid['current'].apply(_round_to_005)
-        pct_grid['percentile'] = pct_grid.apply(_percentile_from_hist, axis=1)
-        pct_grid['median'] = pct_grid.apply(_median_from_hist, axis=1)
 
         # Build best-available labels from live/current snapshot at selected_date
-        fallback_month_codes = {1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M', 7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'}
-        options_map = {}
-        try:
-            opt_map_df = va.load_options_mapping('data/mapping.csv')
-            if opt_map_df is not None and len(opt_map_df) > 0:
-                for comm in opt_map_df['COMMODITY'].dropna().unique():
-                    sub = opt_map_df[opt_map_df['COMMODITY'] == comm]
-                    options_map[comm] = {
-                        int(r['EXPIRY_MONTH']): str(r['OPTIONS']).upper()
-                        for _, r in sub.iterrows()
-                        if pd.notna(r.get('EXPIRY_MONTH', np.nan)) and pd.notna(r.get('OPTIONS', np.nan))
-                    }
-        except Exception:
-            options_map = {}
-
         label_lookup = {}
+        label_lookup_opt = {}
         snap_df = df[df['date'] == selected_date].copy()
         for c in pct_commodities:
             csub = snap_df[snap_df['commodity'] == c].copy()
@@ -1031,11 +1453,7 @@ if active_tab == "IV %ILE":
                 # 2) derive from expiry using mapping / fallback month codes
                 if label is None and 'expiry' in r and pd.notna(r['expiry']):
                     try:
-                        exp = pd.to_datetime(r['expiry'])
-                        mnum = int(exp.month)
-                        code = options_map.get(c.upper(), {}).get(mnum, fallback_month_codes.get(mnum, '?'))
-                        year = int(exp.year) + (1 if code == 'F' else 0)
-                        label = f"{code}{str(year % 100).zfill(2)}"
+                        label = build_contract_labels_from_expiry(pd.Series([r['expiry']]), c).iloc[0]
                     except Exception:
                         label = None
 
@@ -1056,6 +1474,18 @@ if active_tab == "IV %ILE":
                     label = f"M{int(cm)}"
 
                 label_lookup[(c, int(cm))] = label
+                # Also index by options month code when available for robust matching.
+                om = None
+                if 'options_month' in r and pd.notna(r.get('options_month', None)):
+                    om = str(r.get('options_month')).upper()
+                elif 'expiry' in r and pd.notna(r.get('expiry', None)):
+                    try:
+                        em = int(pd.to_datetime(r.get('expiry')).month)
+                        om = get_options_lookup_for_commodity(c).get(em, MONTH_CODE_FALLBACK.get(em, None))
+                    except Exception:
+                        om = None
+                if om:
+                    label_lookup_opt[(c, om)] = label
 
     if len(pct_grid) > 0:
         # Build the battery bar HTML for each commodity
@@ -1078,7 +1508,11 @@ if active_tab == "IV %ILE":
                 current = row['current']
                 median = row['median']
                 # Build contract label with preference map first
-                label = label_lookup.get((commodity, cm), None) if 'label_lookup' in locals() else None
+                label = None
+                if 'label_lookup_opt' in locals() and 'options_month' in row and pd.notna(row.get('options_month', None)):
+                    label = label_lookup_opt.get((commodity, str(row.get('options_month')).upper()), None)
+                if (label is None or str(label).lower() == 'nan') and 'label_lookup' in locals():
+                    label = label_lookup.get((commodity, cm), None)
                 if label is None or str(label).lower() == 'nan':
                     for key in ['contract_code', 'options_month', 'month_label']:
                         if key in row and pd.notna(row.get(key, None)):
@@ -1121,8 +1555,8 @@ if active_tab == "IV %ILE":
                         </div>
                     </div>
                     <div style="width:48px;font-size:12px;color:{text_color};text-align:right;margin-left:8px;font-weight:bold;">{pct:.0f}%</div>
-                    <div style="width:80px;font-size:11px;color:#586069;text-align:right;margin-left:8px;">{current:.1f}</div>
-                    <div style="width:70px;font-size:10px;color:#3d444d;text-align:right;margin-left:4px;">med {median:.1f}</div>
+                    <div style="width:80px;font-size:11px;color:#9aa4b2;text-align:right;margin-left:8px;">{current:.1f}</div>
+                    <div style="width:70px;font-size:10px;color:#7f8a98;text-align:right;margin-left:4px;">med {median:.1f}</div>
                 </div>
                 """)
 
@@ -1307,7 +1741,7 @@ if active_tab == "DASHBOARD":
 # ============================================================================
 # TAB: VOL CHANGE
 # ============================================================================
-if active_tab == "VOL CHANGE":
+if active_tab in ["VOL CHANGE", "VOL CHANGES"]:
     st.markdown('<div class="bloomberg-header"><span>VOL CHANGE</span></div>', unsafe_allow_html=True)
     st.caption("IV and Forward Vol change grids by contract and commodity")
 
@@ -1378,7 +1812,7 @@ if active_tab == "VOL CHANGE":
     else:
         delta_cols = [c for c in grid_1d_iv.columns if c != 'Contract']
         st.dataframe(
-            grid_1d_iv.style.format({col: '{:+.3f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
+            grid_1d_iv.style.format({col: '{:+.2f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
             use_container_width=True,
             height=min(520, 80 + 32 * len(grid_1d_iv)),
             hide_index=True
@@ -1391,7 +1825,7 @@ if active_tab == "VOL CHANGE":
     else:
         delta_cols = [c for c in grid_1d_fwd.columns if c != 'Contract']
         st.dataframe(
-            grid_1d_fwd.style.format({col: '{:+.3f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
+            grid_1d_fwd.style.format({col: '{:+.2f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
             use_container_width=True,
             height=min(520, 80 + 32 * len(grid_1d_fwd)),
             hide_index=True
@@ -1406,7 +1840,7 @@ if active_tab == "VOL CHANGE":
     else:
         delta_cols = [c for c in grid_nd_iv.columns if c != 'Contract']
         st.dataframe(
-            grid_nd_iv.style.format({col: '{:+.3f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
+            grid_nd_iv.style.format({col: '{:+.2f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
             use_container_width=True,
             height=min(520, 80 + 32 * len(grid_nd_iv)),
             hide_index=True
@@ -1419,7 +1853,7 @@ if active_tab == "VOL CHANGE":
     else:
         delta_cols = [c for c in grid_nd_fwd.columns if c != 'Contract']
         st.dataframe(
-            grid_nd_fwd.style.format({col: '{:+.3f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
+            grid_nd_fwd.style.format({col: '{:+.2f}' for col in delta_cols}).applymap(_delta_cell_style, subset=delta_cols),
             use_container_width=True,
             height=min(520, 80 + 32 * len(grid_nd_fwd)),
             hide_index=True
@@ -1627,28 +2061,56 @@ if active_tab == "SKEW":
         help="Select which front-month options contract to use for all commodities in this view."
     )
 
-    skew_commodities = ['CORN', 'SOY', 'MEAL', 'WHEAT', 'KW', 'OIL']
+    skew_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
     lookback_years = lookback_years_from_days(lookback)
     skew_rows = []
     median_rows = []
+    front_opt_by_comm = {}
+    skew_source_candidates = {
+        'P2': ['skew_m1.5', 'skew_neg15', 'P2'],
+        'P1': ['skew_m0.5', 'skew_neg05', 'P1'],
+        'C1': ['skew_p0.5', 'skew_pos05', 'C1'],
+        'C2': ['skew_p1.5', 'skew_pos15', 'C2'],
+        'C3': ['skew_p3.0', 'skew_pos3', 'C3'],
+    }
+    skew_csv_col = {
+        'P2': 'skew_m1.5',
+        'P1': 'skew_m0.5',
+        'C1': 'skew_p0.5',
+        'C2': 'skew_p1.5',
+        'C3': 'skew_p3.0',
+    }
     for c in skew_commodities:
         # Use user-selected front options month across commodities
         front_opt = front_opt_override or current_front_options_month(c, selected_date)
+        front_opt_by_comm[c] = str(front_opt).upper()
         snap, _meta = load_iv_snapshot_cached(c, front_opt, lookback_years)
         if isinstance(snap, pd.DataFrame) and len(snap) > 0:
             tmp = assign_contract_month_from_snapshot(snap, max_months=12)
             tmp['commodity'] = c
-            if 'contract_label' in tmp.columns:
-                tmp['contract_month_label'] = tmp['contract_label'].astype(str)
-            else:
-                tmp['contract_month_label'] = tmp['contract_month'].map(lambda x: f"M{int(x)}")
-            tmp['contract_month_label'] = tmp['contract_month_label'].replace({'nan': np.nan, 'None': np.nan})
+            # Contract labels from shared helper to keep all tabs consistent.
+            tmp['contract_month_label'] = build_contract_labels_from_expiry(
+                tmp.get('expiry', pd.Series(index=tmp.index)),
+                c
+            )
+            tmp['contract_month_label'] = tmp['contract_month_label'].replace({'nan': np.nan, 'None': np.nan, '?00': np.nan})
+            tmp['contract_month_label'] = tmp['contract_month_label'].fillna(
+                tmp.get('contract_label', pd.Series(index=tmp.index)).astype(str).replace({'nan': np.nan, 'None': np.nan})
+            )
             tmp['contract_month_label'] = tmp['contract_month_label'].fillna(tmp['contract_month'].map(lambda x: f"M{int(x)}"))
 
             # Capture historical medians for this commodity
             med_entry = tmp[['contract_month']].copy()
             med_entry['commodity'] = c
-            med_entry['contract_month_label'] = med_entry['contract_month'].map(lambda x: f"M{int(x)}")
+            label_map = (
+                tmp[['contract_month', 'contract_month_label']]
+                .drop_duplicates(subset=['contract_month'], keep='first')
+                .set_index('contract_month')['contract_month_label']
+            )
+            med_entry['contract_month_label'] = med_entry['contract_month'].map(label_map)
+            med_entry['contract_month_label'] = med_entry['contract_month_label'].fillna(
+                med_entry['contract_month'].map(lambda x: f"M{int(x)}")
+            )
             for col in ['P2', 'P1', 'C1', 'C2', 'C3']:
                 med_col = f"{col}_hist_median"
                 med_entry[col] = pd.to_numeric(tmp.get(med_col, np.nan), errors='coerce')
@@ -1671,14 +2133,6 @@ if active_tab == "SKEW":
 
             if len(live_cur) > 0:
                 live_cur = assign_contract_month_from_snapshot(live_cur, max_months=12)
-
-            skew_source_candidates = {
-                'P2': ['skew_m1.5', 'skew_neg15', 'P2'],
-                'P1': ['skew_m0.5', 'skew_neg05', 'P1'],
-                'C1': ['skew_p0.5', 'skew_pos05', 'C1'],
-                'C2': ['skew_p1.5', 'skew_pos15', 'C2'],
-                'C3': ['skew_p3.0', 'skew_pos3', 'C3'],
-            }
 
             for col in ['P2', 'P1', 'C1', 'C2', 'C3']:
                 med_col = f"{col}_hist_median"
@@ -1703,7 +2157,10 @@ if active_tab == "SKEW":
 
                 tmp[f"{col}_current"] = pd.to_numeric(cur_vals, errors='coerce')
                 tmp[col] = pd.to_numeric(cur_vals, errors='coerce') - pd.to_numeric(tmp[med_col], errors='coerce')
-            skew_rows.append(tmp[['commodity', 'contract_month', 'contract_month_label', 'P2', 'P1', 'C1', 'C2', 'C3', 'P2_current', 'P1_current', 'C1_current', 'C2_current', 'C3_current']])
+            keep_cols = ['commodity', 'contract_month', 'contract_month_label', 'P2', 'P1', 'C1', 'C2', 'C3', 'P2_current', 'P1_current', 'C1_current', 'C2_current', 'C3_current']
+            if 'options_month' in tmp.columns:
+                keep_cols.append('options_month')
+            skew_rows.append(tmp[keep_cols])
 
     if len(skew_rows) > 0:
         skew_grid = pd.concat(skew_rows, ignore_index=True)
@@ -1735,7 +2192,41 @@ if active_tab == "SKEW":
             except Exception:
                 return np.nan
 
-        def skew_pct(val, comm, cm, col):
+        skew_pct_dist = load_skew_percentile_dist_cache()
+
+        def skew_pct(val, comm, cm, col, opt_month=None, front_opt=None):
+            # Preferred: percentile distribution conditioned on (commodity, front options month, options month)
+            # from cache/skew_percentile_dist.csv, matching the same regime as current-vs-median.
+            if (
+                isinstance(skew_pct_dist, pd.DataFrame) and len(skew_pct_dist) > 0 and
+                opt_month is not None and front_opt is not None
+            ):
+                csv_base = skew_csv_col.get(col, None)
+                if csv_base is not None:
+                    dsub = skew_pct_dist[
+                        (skew_pct_dist['commodity'] == str(comm).upper()) &
+                        (skew_pct_dist['FRONT_OPTIONS'] == str(front_opt).upper()) &
+                        (skew_pct_dist['OPTIONS'] == str(opt_month).upper())
+                    ]
+                    if len(dsub) > 0 and pd.notna(val):
+                        row = dsub.iloc[0]
+                        pts = []
+                        for p in range(5, 101, 5):
+                            cname = f"{csv_base}_p{p:02d}"
+                            if cname in dsub.columns and pd.notna(row.get(cname, np.nan)):
+                                pts.append((float(row[cname]), float(p)))
+                        if len(pts) > 0:
+                            pts = sorted(pts, key=lambda x: x[0])
+                            x = np.array([t[0] for t in pts], dtype=float)
+                            y = np.array([t[1] for t in pts], dtype=float)
+                            if len(x) == 1:
+                                return float(y[0])
+                            x_unique, idx = np.unique(x, return_index=True)
+                            y_unique = y[idx]
+                            if len(x_unique) >= 2:
+                                return float(np.interp(float(val), x_unique, y_unique, left=0.0, right=100.0))
+
+            # Fallback: historical ranks by contract_month on master_df
             if master_df is None or len(master_df) == 0:
                 return np.nan
             cand_cols = skew_source_candidates.get(col, [])
@@ -1771,7 +2262,8 @@ if active_tab == "SKEW":
                 for col in ['P2', 'P1', 'C1', 'C2', 'C3']:
                     cur_col = f"{col}_current"
                     val = r.get(cur_col, np.nan)
-                    pct_val = skew_pct(val, c, cm, col)
+                    opt_m = r.get('options_month', None)
+                    pct_val = skew_pct(val, c, cm, col, opt_month=opt_m, front_opt=front_opt_by_comm.get(c))
                     data[f"{col} %ile"] = pct_val
                 rows.append(data)
             if len(rows) == 0:
@@ -1958,6 +2450,85 @@ if active_tab == "REALIZED VOL":
 
             st.caption("RV is annualized from rolling log-return stdev (trading-day basis).")
 
+            # ----------------------------------------------------------------
+            # HLOC Volatility Grid (Garman-Klass style)
+            # ----------------------------------------------------------------
+            st.markdown("---")
+            st.subheader("HLOC Volatility (High-Low-Open-Close)")
+
+            prices_df = load_price_data()
+            if prices_df is not None and len(prices_df) > 0:
+                hloc_windows = [5, 10, 20, 50, 100, 200]
+                hloc_result = pa.calculate_hloc_volatility(
+                    prices_df, price_product,
+                    windows=hloc_windows,
+                    n_contracts=2,
+                    as_of_date=asof
+                )
+
+                if len(hloc_result) > 0:
+                    # Build HLOC display table
+                    hloc_rows = []
+                    for _, r in hloc_result.iterrows():
+                        row_data = {'Contract': r['contract_code']}
+                        for w in hloc_windows:
+                            row_data[f'DR {w}D'] = r.get(f'rv_{w}d', np.nan)
+                            row_data[f'HLOC {w}D'] = r.get(f'hloc_{w}d', np.nan)
+                            dr_val = r.get(f'rv_{w}d', np.nan)
+                            hloc_val = r.get(f'hloc_{w}d', np.nan)
+                            if pd.notna(dr_val) and dr_val > 0 and pd.notna(hloc_val):
+                                row_data[f'Ratio {w}D'] = hloc_val / dr_val
+                            else:
+                                row_data[f'Ratio {w}D'] = np.nan
+                        hloc_rows.append(row_data)
+
+                    hloc_display = pd.DataFrame(hloc_rows)
+
+                    # Format columns: group by window
+                    fmt_dict = {}
+                    for w in hloc_windows:
+                        fmt_dict[f'DR {w}D'] = '{:.2f}'
+                        fmt_dict[f'HLOC {w}D'] = '{:.2f}'
+                        fmt_dict[f'Ratio {w}D'] = '{:.2f}'
+
+                    def ratio_color(val):
+                        """Color ratios: >1 = orange (larger range), <1 = blue (smaller range)."""
+                        if pd.isna(val):
+                            return ''
+                        if val > 1.15:
+                            return 'color: #ff9500; font-weight: bold;'
+                        elif val > 1.0:
+                            return 'color: #ffb84d;'
+                        elif val < 0.85:
+                            return 'color: #4da6ff; font-weight: bold;'
+                        elif val < 1.0:
+                            return 'color: #80bfff;'
+                        return ''
+
+                    ratio_cols = [c for c in hloc_display.columns if c.startswith('Ratio')]
+
+                    styled_hloc = hloc_display.style.format(fmt_dict, na_rep='')
+                    for rc in ratio_cols:
+                        styled_hloc = styled_hloc.applymap(ratio_color, subset=[rc])
+
+                    st.dataframe(
+                        styled_hloc,
+                        use_container_width=True,
+                        height=140,
+                        hide_index=True
+                    )
+
+                    st.caption(
+                        "HLOC uses the Garman-Klass estimator: "
+                        "ln(O/C₋₁)² + 0.5·ln(H/L)² − (2ln2−1)·ln(C/O)². "
+                        "DR = Daily Return vol (RMS, not demeaned). "
+                        "Ratio > 1 → range exceeds close-to-close moves."
+                    )
+                else:
+                    st.info("No HLOC data available for this product/date.")
+            else:
+                st.warning("Price data not available for HLOC calculation.")
+
 # ============================================================================
 # TAB: VARIANCE RATIOS
 # ============================================================================
@@ -1973,7 +2544,7 @@ if active_tab == "VAR RATIOS":
 
         with col1:
             front_month = st.selectbox(
-                "Front Options Month",
+                "Front Month",
                 ['H', 'K', 'N', 'Q', 'U', 'X', 'F'],
                 index=0,
                 help="Select the front options month to view variance ratios"
@@ -2049,21 +2620,3 @@ if active_tab == "VAR RATIOS":
     else:
         st.warning("Price data not available. Run update_from_hertz.py to load price data.")
 
-# Footer
-st.markdown("---")
-footer_left = st.container()
-with footer_left:
-    if st.button("Refresh Live", key="refresh_live_bottom"):
-        try:
-            import subprocess
-            result = subprocess.run(
-                ['python', 'scripts/xlsm_to_csv.py', '-o', 'data/live_vols.csv'],
-                capture_output=True, text=True, timeout=60
-            )
-            if result.returncode == 0:
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                st.error(f"Refresh failed: {result.stderr[-200:]}")
-        except Exception as e:
-            st.error(f"Refresh failed: {e}")
