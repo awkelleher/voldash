@@ -156,9 +156,9 @@ def precompute_all(commodity_filter: str = None, month_filter: str = None):
                 ok = precompute_single(comm_prices, commodity, month, lookback)
                 if ok:
                     success += 1
-                    print(f"  ✓ {label}")
+                    print(f"  OK {label}")
                 else:
-                    print(f"  ✗ {label} (no data)")
+                    print(f"  SKIP {label} (no data)")
 
     print(f"\nDone: {success} computed, {skipped} cached (fresh), {total - success - skipped} no data")
 
