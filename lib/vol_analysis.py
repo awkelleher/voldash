@@ -707,11 +707,29 @@ def load_verdad_predictions(filepath='data/verdad.7.xlsx', sheet='dashboard'):
     # Column mapping: verdad column names -> our commodity names
     col_map = {'S': 'SOY', 'SM': 'MEAL', 'BO': 'OIL', 'C': 'CORN', 'W': 'WHEAT', 'KW': 'KW'}
 
-    # CSV format: first column = month code, headers = S/SM/BO/C/W/KW
+    # CSV format: row 1 = headers (overall level, S, SM, BO, C, W, KW)
+    #             row 2 = overall level values
+    #             row 4 = repeated headers
+    #             rows 5-16 = month codes F-Z with per-month RV
     if str(filepath).lower().endswith('.csv'):
         vdf = pd.read_csv(filepath)
         month_col = vdf.columns[0]
         vdf[month_col] = vdf[month_col].astype(str).str.upper().str.strip()
+
+        # Grab explicit overall levels from first data row (empty month_col)
+        overall = {}
+        for _, r in vdf.iterrows():
+            m = str(r[month_col]).strip()
+            if m in ('', 'NAN'):
+                for src, dst in col_map.items():
+                    if src in vdf.columns and pd.notna(r[src]):
+                        try:
+                            overall[dst] = float(r[src])
+                        except (ValueError, TypeError):
+                            pass
+                if overall:
+                    break  # first non-empty row with data is the overall row
+
         monthly = {c: {} for c in col_map.values()}
         for _, r in vdf.iterrows():
             m = str(r[month_col]).strip()
@@ -720,7 +738,12 @@ def load_verdad_predictions(filepath='data/verdad.7.xlsx', sheet='dashboard'):
             for src, dst in col_map.items():
                 if src in vdf.columns and pd.notna(r[src]):
                     monthly[dst][m] = float(r[src])
-        overall = {k: (float(np.nanmean(list(v.values()))) if len(v) > 0 else np.nan) for k, v in monthly.items()}
+
+        # Fill any missing overall from mean of monthly
+        for k, v in monthly.items():
+            if k not in overall and len(v) > 0:
+                overall[k] = float(np.nanmean(list(v.values())))
+
         return overall, monthly
 
     # Excel format
@@ -1054,6 +1077,220 @@ def calculate_power_grid(df, date, predicted_rv_dict, commodities=None, max_mont
             metadata[key] = metadata[key].reindex(columns=month_cols)
 
     return power_df, metadata
+
+
+def _date_to_time_period(dt):
+    """Convert a date to a time period label like 'January1', 'February3', etc.
+    Slice 1 = days 1-10, Slice 2 = days 11-20, Slice 3 = days 21+."""
+    month_name = dt.strftime('%B')
+    day = dt.day
+    if day <= 10:
+        sl = 1
+    elif day <= 20:
+        sl = 2
+    else:
+        sl = 3
+    return f"{month_name}{sl}"
+
+
+# Canonical row order for IV calendar grids (36 periods)
+_TIME_PERIOD_ORDER = []
+for _mn in ['January', 'February', 'March', 'April', 'May', 'June',
+            'July', 'August', 'September', 'October', 'November', 'December']:
+    for _sl in [1, 2, 3]:
+        _TIME_PERIOD_ORDER.append(f"{_mn}{_sl}")
+
+# Standard options month code order
+_OPTIONS_CODE_ORDER = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+
+# Cycle months per commodity — serial months outside this set are
+# only listed close to expiry (capped at _SERIAL_DTE_CAP trading days).
+_CYCLE_MONTHS = {
+    'SOY':   {'F', 'H', 'K', 'N', 'Q', 'U', 'X'},
+    'MEAL':  {'F', 'H', 'K', 'N', 'Q', 'U', 'V', 'Z'},
+    'OIL':   {'F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z'},
+    'CORN':  {'H', 'K', 'N', 'U', 'Z'},
+    'WHEAT': {'H', 'K', 'N', 'U', 'Z'},
+    'KW':    {'H', 'K', 'N', 'U', 'Z'},
+}
+_SERIAL_DTE_CAP = 70  # max trading DTE for serial (non-cycle) month contracts
+
+
+def _filter_serial_months(cdf, commodity):
+    """Remove serial-month observations that are too far from expiry.
+
+    Cycle months are kept regardless of DTE.  Serial months are only kept
+    when trading_dte <= _SERIAL_DTE_CAP (matching the IV-calendar Excel).
+    """
+    cycle = _CYCLE_MONTHS.get(commodity.upper(), set())
+    if not cycle:
+        return cdf
+    is_serial = ~cdf['options_code'].isin(cycle)
+    if 'trading_dte' in cdf.columns:
+        dte_col = 'trading_dte'
+    else:
+        # Compute from date/expiry as calendar days
+        cdf = cdf.copy()
+        cdf['_dte'] = (cdf['expiry'] - cdf['date']).dt.days
+        dte_col = '_dte'
+    too_far = is_serial & (pd.to_numeric(cdf[dte_col], errors='coerce') > _SERIAL_DTE_CAP)
+    result = cdf[~too_far]
+    if '_dte' in result.columns:
+        result = result.drop(columns=['_dte'])
+    return result
+
+
+def compute_iv_calendar_grid(df, commodity, mapping_df=None):
+    """
+    Compute average and median dirty_vol grids for a commodity,
+    grouped by ~10-day calendar period and contract month code.
+
+    Args:
+        df: master dataframe with date, commodity, expiry, dirty_vol columns
+        commodity: e.g. 'SOY', 'CORN'
+        mapping_df: mapping.csv dataframe (loaded automatically if None)
+
+    Returns:
+        (avg_grid, median_grid): DataFrames with time period rows x contract month columns
+    """
+    if mapping_df is None:
+        mapping_df = load_options_mapping()
+
+    cdf = df[df['commodity'] == commodity].copy()
+    if len(cdf) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    cdf['date'] = pd.to_datetime(cdf['date'], errors='coerce')
+    cdf['expiry'] = pd.to_datetime(cdf['expiry'], errors='coerce')
+    cdf = cdf.dropna(subset=['date', 'expiry', 'dirty_vol'])
+    cdf = cdf[cdf['dirty_vol'] > 0]
+
+    # Derive time period from date
+    cdf['time_period'] = cdf['date'].apply(_date_to_time_period)
+
+    # Derive options code from expiry month using mapping
+    em_to_opt = {}
+    if len(mapping_df) > 0 and 'EXPIRY_MONTH' in mapping_df.columns:
+        sub = mapping_df[mapping_df['COMMODITY'] == commodity.upper()]
+        em_to_opt = {
+            int(r['EXPIRY_MONTH']): r['OPTIONS']
+            for _, r in sub.iterrows()
+            if pd.notna(r.get('EXPIRY_MONTH'))
+        }
+    cdf['options_code'] = cdf['expiry'].dt.month.map(em_to_opt)
+    cdf = cdf.dropna(subset=['options_code'])
+
+    # Keep only the nearest expiry per (date, options_code) to avoid double-counting
+    # when two contracts share the same month code (e.g. K25 and K26 both alive in Feb 2025)
+    cdf = cdf.sort_values('expiry')
+    cdf = cdf.drop_duplicates(subset=['date', 'options_code'], keep='first')
+
+    # Exclude serial-month contracts that are too far from expiry
+    cdf = _filter_serial_months(cdf, commodity)
+
+    # Group and aggregate
+    grouped = cdf.groupby(['time_period', 'options_code'])['dirty_vol']
+    avg_long = grouped.mean().reset_index().rename(columns={'dirty_vol': 'avg'})
+    med_long = grouped.median().reset_index().rename(columns={'dirty_vol': 'med'})
+
+    # Pivot to wide format
+    avg_grid = avg_long.pivot(index='time_period', columns='options_code', values='avg')
+    med_grid = med_long.pivot(index='time_period', columns='options_code', values='med')
+
+    # Order rows chronologically
+    for grid in [avg_grid, med_grid]:
+        grid.index = pd.CategoricalIndex(grid.index, categories=_TIME_PERIOD_ORDER, ordered=True)
+    avg_grid = avg_grid.sort_index()
+    med_grid = med_grid.sort_index()
+
+    # Order columns in standard options code order (only keep columns that exist)
+    col_order = [c for c in _OPTIONS_CODE_ORDER if c in avg_grid.columns]
+    avg_grid = avg_grid[col_order]
+    med_grid = med_grid[col_order]
+
+    return avg_grid, med_grid
+
+
+def compute_spread_builder(df, commodity, month_1, month_2, mapping_df=None):
+    """
+    Compute vol spread (month_1 - month_2) for each date, grouped by ~10-day
+    calendar period.  Returns summary stats per period and all individual obs.
+
+    Args:
+        df: master dataframe with date, commodity, expiry, dirty_vol
+        commodity: e.g. 'SOY', 'CORN'
+        month_1: options month code for leg 1 (e.g. 'J')
+        month_2: options month code for leg 2 (e.g. 'K')
+        mapping_df: mapping.csv (loaded automatically if None)
+
+    Returns:
+        (summary_df, detail_df)
+        summary_df: one row per time period with columns
+            [time_period, low, median, average, high, count]
+        detail_df: one row per date with columns
+            [date, time_period, vol_1, vol_2, spread]
+            sorted by vol_1 descending
+    """
+    if mapping_df is None:
+        mapping_df = load_options_mapping()
+
+    cdf = df[df['commodity'] == commodity].copy()
+    if len(cdf) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    cdf['date'] = pd.to_datetime(cdf['date'], errors='coerce')
+    cdf['expiry'] = pd.to_datetime(cdf['expiry'], errors='coerce')
+    cdf = cdf.dropna(subset=['date', 'expiry', 'dirty_vol'])
+    cdf = cdf[cdf['dirty_vol'] > 0]
+
+    # Derive options code from expiry month
+    em_to_opt = {}
+    if len(mapping_df) > 0 and 'EXPIRY_MONTH' in mapping_df.columns:
+        sub = mapping_df[mapping_df['COMMODITY'] == commodity.upper()]
+        em_to_opt = {
+            int(r['EXPIRY_MONTH']): r['OPTIONS']
+            for _, r in sub.iterrows()
+            if pd.notna(r.get('EXPIRY_MONTH'))
+        }
+    cdf['options_code'] = cdf['expiry'].dt.month.map(em_to_opt)
+    cdf = cdf.dropna(subset=['options_code'])
+
+    # Keep nearest expiry per (date, options_code)
+    cdf = cdf.sort_values('expiry')
+    cdf = cdf.drop_duplicates(subset=['date', 'options_code'], keep='first')
+
+    # Exclude serial-month contracts that are too far from expiry
+    cdf = _filter_serial_months(cdf, commodity)
+
+    # Derive time period
+    cdf['time_period'] = cdf['date'].apply(_date_to_time_period)
+
+    # Pivot: one row per date, columns = options codes
+    leg1 = cdf[cdf['options_code'] == month_1][['date', 'time_period', 'dirty_vol']].rename(
+        columns={'dirty_vol': 'vol_1'})
+    leg2 = cdf[cdf['options_code'] == month_2][['date', 'dirty_vol']].rename(
+        columns={'dirty_vol': 'vol_2'})
+
+    merged = leg1.merge(leg2, on='date', how='inner')
+    if len(merged) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    merged['spread'] = merged['vol_1'] - merged['vol_2']
+
+    # Detail: sorted by vol_1 descending
+    detail_df = merged.sort_values('vol_1', ascending=False).reset_index(drop=True)
+
+    # Summary stats per time period
+    summary = merged.groupby('time_period')['spread'].agg(
+        low='min', median='median', average='mean', high='max', count='count'
+    ).reset_index()
+
+    # Order chronologically
+    summary['time_period'] = pd.Categorical(
+        summary['time_period'], categories=_TIME_PERIOD_ORDER, ordered=True)
+    summary = summary.sort_values('time_period').reset_index(drop=True)
+
+    return summary, detail_df
 
 
 if __name__ == "__main__":
