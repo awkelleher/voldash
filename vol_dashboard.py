@@ -1097,14 +1097,174 @@ if active_tab == "SPREAD BUILDER":
     with sb_col3:
         sb_month2 = st.selectbox("Month 2", _all_codes, index=4, key="sb_month2")  # default K
 
-    # Normalize toggle + range input
-    norm_col1, norm_col2 = st.columns([1, 3])
+    # Normalize toggle + range input + Run All button
+    norm_col1, norm_col2, norm_col3 = st.columns([1, 2, 1])
     with norm_col1:
         sb_normalize = st.toggle("Normalize", value=False, key="sb_normalize")
     with norm_col2:
         sb_norm_range = st.number_input(
             "+/- Range", min_value=0.1, max_value=50.0, value=2.5, step=0.5,
             key="sb_norm_range", disabled=not sb_normalize)
+    with norm_col3:
+        sb_run_all = st.button("Run All", key="sb_run_all", use_container_width=True)
+
+    # ── "Run All" – show all consecutive IV spreads from live data ─────────
+    if sb_run_all:
+        _mapping_df = va.load_options_mapping()
+        _em_sub = _mapping_df[_mapping_df['COMMODITY'] == sb_commodity.upper()]
+        _em_to_opt = {
+            int(r['EXPIRY_MONTH']): r['OPTIONS']
+            for _, r in _em_sub.iterrows()
+            if pd.notna(r.get('EXPIRY_MONTH'))
+        }
+        _opt_to_em = {v: k for k, v in _em_to_opt.items()}
+
+        # Determine which source has data and gather all available IVs
+        _ra_source = "live_vols"
+        _ra_vols = {}   # options_month -> dirty_vol
+        _ra_asof = pd.NaT
+
+        if live_df is not None and len(live_df) > 0:
+            _ra_sub = live_df[live_df['commodity'] == sb_commodity].copy()
+            _ra_sub['date'] = pd.to_datetime(_ra_sub['date'], errors='coerce')
+            _ra_sub = _ra_sub[_ra_sub['date'].notna()]
+            if len(_ra_sub) > 0:
+                _ra_le = _ra_sub[_ra_sub['date'] <= selected_date]
+                _ra_asof = _ra_le['date'].max() if len(_ra_le) > 0 else _ra_sub['date'].max()
+                _ra_day = _ra_sub[_ra_sub['date'] == _ra_asof].copy()
+                _ra_day['expiry'] = pd.to_datetime(_ra_day['expiry'], errors='coerce')
+                _ra_day = _ra_day.dropna(subset=['expiry', 'dirty_vol'])
+                _ra_day['options_code'] = _ra_day['expiry'].dt.month.map(_em_to_opt)
+                _ra_day = _ra_day.dropna(subset=['options_code'])
+                _ra_day = _ra_day.sort_values('expiry').drop_duplicates(
+                    subset=['options_code'], keep='first')
+                _ra_vols = dict(zip(_ra_day['options_code'], _ra_day['dirty_vol']))
+
+        if len(_ra_vols) < 2:
+            _ra_source = "snapshot fallback"
+            _ra_msub = df[df['commodity'] == sb_commodity].copy()
+            _ra_msub['date'] = pd.to_datetime(_ra_msub['date'], errors='coerce')
+            _ra_msub = _ra_msub[_ra_msub['date'].notna()]
+            if len(_ra_msub) > 0:
+                _ra_le = _ra_msub[_ra_msub['date'] <= selected_date]
+                _ra_asof = _ra_le['date'].max() if len(_ra_le) > 0 else _ra_msub['date'].max()
+                _ra_day = _ra_msub[_ra_msub['date'] == _ra_asof].copy()
+                _ra_day['expiry'] = pd.to_datetime(_ra_day['expiry'], errors='coerce')
+                _ra_day = _ra_day.dropna(subset=['expiry', 'dirty_vol'])
+                _ra_day['options_code'] = _ra_day['expiry'].dt.month.map(_em_to_opt)
+                _ra_day = _ra_day.dropna(subset=['options_code'])
+                _ra_day = _ra_day.sort_values('expiry').drop_duplicates(
+                    subset=['options_code'], keep='first')
+                _ra_vols = dict(zip(_ra_day['options_code'], _ra_day['dirty_vol']))
+
+        # Determine front month from live data (nearest DTE)
+        _ra_avail = sorted(_ra_vols.keys(), key=lambda m: _all_codes.index(m) if m in _all_codes else 99)
+        if len(_ra_avail) >= 2:
+            # Front month = the one in live data with the smallest expiry month
+            # relative to the data date.  Use the order from live DTE.
+            if live_df is not None and len(live_df) > 0:
+                _ra_front_sub = live_df[
+                    (live_df['commodity'] == sb_commodity)
+                ].copy()
+                _ra_front_sub['date'] = pd.to_datetime(_ra_front_sub['date'], errors='coerce')
+                _ra_front_sub['expiry'] = pd.to_datetime(_ra_front_sub['expiry'], errors='coerce')
+                _ra_front_sub = _ra_front_sub[_ra_front_sub['date'] == _ra_asof]
+                if len(_ra_front_sub) > 0:
+                    _ra_front_row = _ra_front_sub.loc[
+                        (_ra_front_sub['expiry'] - _ra_front_sub['date']).dt.days.idxmin()
+                    ]
+                    _ra_front_em = _ra_front_row['expiry'].month
+                    _ra_front_month = _em_to_opt.get(int(_ra_front_em), _ra_avail[0])
+                else:
+                    _ra_front_month = _ra_avail[0]
+            else:
+                _ra_front_month = _ra_avail[0]
+
+            # Build consecutive pairs from ALL available live contracts
+            # ordered from front month through the 12-month cycle.
+            # Serial months are included — percentile/median will show n/a
+            # when no precomputed history exists for that pair.
+            _ra_ordered = []
+            if _ra_front_month in _all_codes:
+                start_idx = _all_codes.index(_ra_front_month)
+                for i in range(12):
+                    code = _all_codes[(start_idx + i) % 12]
+                    if code in _ra_vols:
+                        _ra_ordered.append(code)
+
+            _ra_pairs = [(_ra_ordered[i], _ra_ordered[i + 1])
+                         for i in range(len(_ra_ordered) - 1)]
+
+            if _ra_pairs:
+                # Load precomputed spread percentile distribution for medians + percentile lookup
+                _ra_spread_dist = pd.DataFrame()
+                _ra_lookup_fn = None
+                try:
+                    from scripts.iv_spread_percentiles_precompute import (
+                        load_iv_spread_percentile_dist, lookup_iv_spread_percentile,
+                    )
+                    _ra_spread_dist = load_iv_spread_percentile_dist(
+                        commodity=sb_commodity, front_options_month=_ra_front_month)
+                    _ra_lookup_fn = lookup_iv_spread_percentile
+                except Exception:
+                    pass
+
+                _ra_asof_txt = pd.to_datetime(_ra_asof).strftime('%Y-%m-%d') if pd.notna(_ra_asof) else "n/a"
+                st.markdown("---")
+                st.markdown(
+                    f"**ALL CONSECUTIVE SPREADS** — {sb_commodity} | Front: **{_ra_front_month}** | "
+                    f"Source: `{_ra_source}` | As of: `{_ra_asof_txt}`"
+                )
+
+                # Display spreads in rows of 3 metric boxes
+                _ra_n = len(_ra_pairs)
+                for row_start in range(0, _ra_n, 3):
+                    row_pairs = _ra_pairs[row_start:row_start + 3]
+                    cols = st.columns(len(row_pairs))
+                    for col_idx, (m1, m2) in enumerate(row_pairs):
+                        with cols[col_idx]:
+                            _v1 = _ra_vols.get(m1, np.nan)
+                            _v2 = _ra_vols.get(m2, np.nan)
+                            _sprd = _v1 - _v2 if pd.notna(_v1) and pd.notna(_v2) else np.nan
+
+                            # Look up median and percentile from precomputed distribution
+                            _pair_str = f"{m1}-{m2}"
+                            _median = np.nan
+                            _pctile = np.nan
+                            if not _ra_spread_dist.empty:
+                                _dist_row = _ra_spread_dist[
+                                    _ra_spread_dist['SPREAD_PAIR'] == _pair_str
+                                ]
+                                if len(_dist_row) > 0:
+                                    _median = _dist_row.iloc[0].get('spread_p50', np.nan)
+                            if _ra_lookup_fn is not None and pd.notna(_sprd):
+                                _lk = _ra_lookup_fn(_sprd, sb_commodity, _ra_front_month, _pair_str)
+                                if _lk.get("percentile") is not None:
+                                    _pctile = _lk["percentile"] * 100.0
+
+                            # Build delta string: percentile (matching CURRENT SPREAD style)
+                            if pd.notna(_pctile):
+                                _delta_txt = f"{_pctile:.0f}th %ile"
+                            else:
+                                _delta_txt = None
+
+                            # Display metric box
+                            st.metric(
+                                f"{m1}-{m2} Spread",
+                                f"{_sprd:+.2f}" if pd.notna(_sprd) else "—",
+                                delta=_delta_txt,
+                            )
+                            # Caption: median + leg IVs
+                            _v1_txt = f"{_v1:.2f}" if pd.notna(_v1) else "—"
+                            _v2_txt = f"{_v2:.2f}" if pd.notna(_v2) else "—"
+                            _med_txt = f"Median: {_median:+.2f}" if pd.notna(_median) else "Median: n/a"
+                            st.caption(f"{_med_txt}  |  {m1}: {_v1_txt}  |  {m2}: {_v2_txt}")
+
+                st.markdown("---")
+            else:
+                st.warning("Not enough contracts in live data to form consecutive pairs.")
+        else:
+            st.warning("Not enough contracts available to compute spreads.")
 
     if sb_month1 == sb_month2:
         st.warning("Month 1 and Month 2 must be different.")

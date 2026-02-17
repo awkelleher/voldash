@@ -143,11 +143,20 @@ def load_vol_skew(path: str = None) -> pd.DataFrame:
         lambda r: lookup.get((r["commodity"], r["expiry_month"]), "?"), axis=1
     )
 
-    # Front options month on each observation date
-    df["obs_month"] = df["date"].dt.month
-    df["front_options_month"] = df[["commodity", "obs_month"]].apply(
-        lambda r: lookup.get((r["commodity"], r["obs_month"]), "?"), axis=1
+    # Front options month: derived from the ACTUAL front contract's expiry month,
+    # not the observation date's calendar month.  Near month-end the current
+    # month's option has already expired so the front is next month's expiry.
+    df["_dte"] = (df["expiry"] - df["date"]).dt.days
+    front_expiry_month = (
+        df.loc[df.groupby(["date", "commodity"])["_dte"].idxmin()]
+        [["date", "commodity", "expiry_month"]]
+        .rename(columns={"expiry_month": "_front_expiry_month"})
     )
+    df = df.merge(front_expiry_month, on=["date", "commodity"], how="left")
+    df["front_options_month"] = df[["commodity", "_front_expiry_month"]].apply(
+        lambda r: lookup.get((r["commodity"], int(r["_front_expiry_month"])), "?"), axis=1
+    )
+    df.drop(columns=["_dte", "_front_expiry_month"], inplace=True)
 
     # Contract label for display (e.g., "H25")
     df["contract_label"] = (
@@ -178,7 +187,7 @@ def load_vol_skew(path: str = None) -> pd.DataFrame:
     is_deferred = df["_days_to_expiry"] > nearest_expiry + 30  # >30 day gap = different year
     df["curve_position"] = month_offset + is_deferred.astype(int) * 12
 
-    df.drop(columns=["obs_month", "_days_to_expiry"], inplace=True)
+    df.drop(columns=["_days_to_expiry"], inplace=True)
 
     return df
 
@@ -778,10 +787,8 @@ def precompute_all(commodity_filter: str = None, month_filter: str = None):
     compute_iv_percentile_dist_csv(vol_df)
     compute_skew_percentile_dist_csv(vol_df)
 
-    # Note: median_skew.csv is NOT regenerated here automatically.
-    # It is maintained as an externally-validated file.
-    # To regenerate from raw data, run:
-    #     compute_median_skew_csv(load_vol_skew())
+    # Generate median_skew.csv (front-month-conditioned skew medians)
+    compute_median_skew_csv(vol_df)
 
 
 # ── Fast Loaders for Streamlit ─────────────────────────────────────────────────
@@ -1070,11 +1077,59 @@ def lookup_skew_percentile(
     return {"percentile": None, "error": "Unexpected"}
 
 
+_front_month_cache = {}   # (date_str, commodity) -> options code
+
+
 def get_current_front_month(commodity: str, date: pd.Timestamp = None) -> str:
-    """Get the current front options month code."""
+    """
+    Get the current front options month code by finding the actual
+    nearest-to-expire contract in master_vol_skew on or before `date`.
+
+    Falls back to calendar-month lookup if data is unavailable.
+    Results are cached in-memory so repeated calls don't re-read the CSV.
+    """
     if date is None:
         date = pd.Timestamp.now()
-    return expiry_month_to_options_code(date.month, commodity)
+
+    cache_key = (str(date.date()), commodity.upper())
+    if cache_key in _front_month_cache:
+        return _front_month_cache[cache_key]
+
+    try:
+        raw = pd.read_csv(VOL_SKEW_PATH, usecols=["date", "commodity", "expiry"])
+        raw["date"] = pd.to_datetime(raw["date"], format="mixed")
+        raw["expiry"] = pd.to_datetime(raw["expiry"], format="mixed")
+        raw["commodity"] = raw["commodity"].str.upper()
+
+        # Build cache for ALL commodities on the nearest available date at once
+        available = raw[raw["date"] <= date]
+        if available.empty:
+            result = expiry_month_to_options_code(date.month, commodity)
+            _front_month_cache[cache_key] = result
+            return result
+
+        latest_date = available["date"].max()
+        on_date = available[available["date"] == latest_date].copy()
+        on_date["_dte"] = (on_date["expiry"] - on_date["date"]).dt.days
+
+        # Find front contract per commodity and cache all at once
+        for comm, grp in on_date.groupby("commodity"):
+            front_row = grp.loc[grp["_dte"].idxmin()]
+            front_expiry_month = front_row["expiry"].month
+            code = expiry_month_to_options_code(front_expiry_month, comm)
+            _front_month_cache[(str(date.date()), comm)] = code
+
+        if cache_key in _front_month_cache:
+            return _front_month_cache[cache_key]
+
+        # Commodity not in data
+        result = expiry_month_to_options_code(date.month, commodity)
+        _front_month_cache[cache_key] = result
+        return result
+    except Exception:
+        result = expiry_month_to_options_code(date.month, commodity)
+        _front_month_cache[cache_key] = result
+        return result
 
 
 def get_cache_status() -> pd.DataFrame:

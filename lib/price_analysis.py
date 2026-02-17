@@ -246,6 +246,131 @@ def detect_roll_schedule(df, commodity):
     return roll_counts
 
 
+def calculate_hloc_volatility(df, commodity, windows=[5, 10, 20, 50, 100, 200],
+                               n_contracts=2, as_of_date=None):
+    """
+    Calculate HLOC (High-Low-Open-Close) realized volatility per contract.
+
+    Uses the modified Garman-Klass estimator:
+        HLOC_var = ln(O/C_prev)^2 + 0.5*ln(H/L)^2 - (2*ln(2)-1)*ln(C/O)^2
+
+    Annualized HLOC vol = sqrt(mean(HLOC_var over N days)) * sqrt(252)
+
+    Args:
+        df: Price dataframe with date, commodity, contract_code, high, low, open, close
+        commodity: Commodity code (e.g. 'SOY')
+        windows: List of lookback windows in trading days
+        n_contracts: Number of nearest contracts to return (default 2)
+        as_of_date: Date to compute as of (default: latest available)
+
+    Returns:
+        DataFrame with columns: contract_code, hloc_5d, hloc_10d, ... (annualized %)
+        Also includes daily_ret columns for ratio calculation.
+    """
+    comm_df = df[df['commodity'] == commodity].copy()
+    if len(comm_df) == 0:
+        return pd.DataFrame()
+
+    comm_df = comm_df.sort_values(['contract_code', 'date'])
+
+    if as_of_date is None:
+        as_of_date = comm_df['date'].max()
+    else:
+        as_of_date = pd.to_datetime(as_of_date)
+
+    # Determine the contract sort order
+    month_order = {
+        'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+        'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
+    }
+
+    def contract_sort_key(code):
+        if pd.isna(code) or len(str(code)) < 2:
+            return (9999, 99)
+        code = str(code)
+        letter = code[0]
+        try:
+            year = int("20" + code[1:])
+        except Exception:
+            year = 9999
+        return (year, month_order.get(letter, 99))
+
+    # Find active contracts as of the date
+    active_on_date = comm_df[comm_df['date'] == as_of_date]['contract_code'].unique()
+    if len(active_on_date) == 0:
+        # Fall back to nearest prior date
+        prior = comm_df[comm_df['date'] <= as_of_date]['date'].max()
+        if pd.isna(prior):
+            return pd.DataFrame()
+        active_on_date = comm_df[comm_df['date'] == prior]['contract_code'].unique()
+
+    # Sort contracts and take nearest n
+    sorted_contracts = sorted(active_on_date, key=contract_sort_key)[:n_contracts]
+
+    max_window = max(windows)
+    results = []
+
+    for contract in sorted_contracts:
+        cdf = comm_df[comm_df['contract_code'] == contract].copy()
+        cdf = cdf.sort_values('date').reset_index(drop=True)
+
+        # Need at least 2 rows
+        if len(cdf) < 2:
+            continue
+
+        # Only keep data up to as_of_date
+        cdf = cdf[cdf['date'] <= as_of_date]
+        if len(cdf) < 2:
+            continue
+
+        # Calculate HLOC variance per day
+        # HLOC_var = ln(O/C_prev)^2 + 0.5*ln(H/L)^2 - (2*ln(2)-1)*ln(C/O)^2
+        close_prev = cdf['close'].shift(1)
+        ln2_coeff = 2 * np.log(2) - 1  # ~0.3863
+
+        overnight = np.log(cdf['open'] / close_prev)
+        hl_range = np.log(cdf['high'] / cdf['low'])
+        co_return = np.log(cdf['close'] / cdf['open'])
+
+        cdf['hloc_var'] = overnight**2 + 0.5 * hl_range**2 - ln2_coeff * co_return**2
+
+        # Also calculate daily log return (close-to-close) for ratio
+        cdf['daily_ret'] = np.log(cdf['close'] / close_prev)
+
+        # Take the most recent max_window+1 rows (need shift, so +1)
+        cdf = cdf.dropna(subset=['hloc_var']).tail(max_window)
+
+        rec = {'contract_code': contract}
+
+        for w in windows:
+            recent = cdf.tail(w)
+            if len(recent) >= min(w, 3):  # Need at least 3 obs or full window
+                # HLOC vol: sqrt(mean(hloc_var)) * sqrt(252) * 100
+                hloc_mean = recent['hloc_var'].mean()
+                if hloc_mean > 0:
+                    rec[f'hloc_{w}d'] = np.sqrt(hloc_mean) * np.sqrt(252) * 100
+                else:
+                    rec[f'hloc_{w}d'] = np.nan
+
+                # Daily ret vol: RMS (root mean square, not demeaned) * sqrt(252) * 100
+                # This matches the Excel hvol() function: sqrt(mean(ret^2)) * sqrt(252)
+                rms = np.sqrt(np.mean(recent['daily_ret']**2))
+                if rms > 0:
+                    rec[f'rv_{w}d'] = rms * np.sqrt(252) * 100
+                else:
+                    rec[f'rv_{w}d'] = np.nan
+            else:
+                rec[f'hloc_{w}d'] = np.nan
+                rec[f'rv_{w}d'] = np.nan
+
+        results.append(rec)
+
+    if not results:
+        return pd.DataFrame()
+
+    return pd.DataFrame(results)
+
+
 if __name__ == "__main__":
     print("="*70)
     print("PRICE ANALYSIS - REALIZED VOLATILITY")
