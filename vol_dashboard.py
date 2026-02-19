@@ -12,6 +12,7 @@ from lib import vol_analysis as va
 from lib import variance_ratios as vr
 from lib import price_analysis as pa
 from datetime import datetime, timedelta
+from generate_snapshot import add_snapshot_button
 
 # Shared CME holiday set — used by VAR CAL and FWD VOL CURVE
 CME_HOLIDAYS = {
@@ -851,6 +852,44 @@ if st.session_state.get("theme_mode", "Dark") == "Light":
         .stDataFrame {
             border: 1px solid #d0d7de !important;
         }
+        /* Top navigation + tab/radio controls in light mode */
+        div[data-testid="stSegmentedControl"] {
+            background-color: #ffffff !important;
+            border: 1px solid #d0d7de !important;
+            border-radius: 8px !important;
+            padding: 2px !important;
+        }
+        div[data-testid="stSegmentedControl"] button {
+            color: #1f2328 !important;
+            background-color: transparent !important;
+        }
+        div[data-testid="stSegmentedControl"] button[aria-pressed="true"] {
+            background-color: #ddf4ff !important;
+            color: #0969da !important;
+            font-weight: 600 !important;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            background-color: #ffffff !important;
+            border-bottom: 1px solid #d0d7de !important;
+        }
+        .stTabs [data-baseweb="tab"] {
+            background-color: #ffffff !important;
+            color: #1f2328 !important;
+            border: 1px solid #d0d7de !important;
+        }
+        .stTabs [aria-selected="true"] {
+            background-color: #ddf4ff !important;
+            color: #0969da !important;
+            border-bottom: 2px solid #0969da !important;
+        }
+        div[role="radiogroup"] label[data-baseweb="radio"] > div:last-child {
+            color: #1f2328 !important;
+        }
+        div[role="radiogroup"] label[data-baseweb="radio"][aria-checked="true"] > div:last-child,
+        div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) > div:last-child {
+            color: #0969da !important;
+            font-weight: 600 !important;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -967,6 +1006,9 @@ except Exception as e:
     st.error(f"Error loading data: {str(e)}")
     st.stop()
 
+with st.sidebar:
+    add_snapshot_button(prices_df=load_price_data(), vol_skew_df=df, master_df=master_df)
+
 # Active section selector (compute only selected section)
 if active_section == "Vol Sheet":
     tab_options = [
@@ -987,12 +1029,12 @@ elif active_section == "Price Sheet":
     active_tab = st.radio("View", price_tab_options, horizontal=True, key="active_tab_price")
     price_product = None
     if active_tab == "REALIZED VOL":
-        # Narrow product selector to half its previous width (now ~10% of row)
-        col_prod, _ = st.columns([1, 9])
+        # Product selector widened by 20% (now ~12% of row)
+        col_prod, _ = st.columns([1.2, 8.8])
         with col_prod:
             price_product = st.selectbox(
                 "Product",
-                ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW'],
+                ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL'],
                 index=0,
                 key="price_sheet_product"
             )
@@ -1002,7 +1044,11 @@ elif active_section == "Skew Analyzer":
     price_product = None
 elif active_section == "IV Calendar":
     st.markdown('<div class="bloomberg-header"><span>IV CALENDAR</span></div>', unsafe_allow_html=True)
-    active_tab = "IV CALENDAR"
+    iv_cal_tab_options = ["CALENDAR", "HEAT MAP"]
+    active_tab = st.radio("View", iv_cal_tab_options, horizontal=True, key="active_tab_iv_cal")
+    # Map back to internal names
+    if active_tab == "CALENDAR":
+        active_tab = "IV CALENDAR"
     price_product = None
 elif active_section == "Spread Builder":
     st.markdown('<div class="bloomberg-header"><span>SPREAD BUILDER</span></div>', unsafe_allow_html=True)
@@ -1226,7 +1272,7 @@ if active_tab == "POWER GRID":
     st.caption("(FWD VOL - PREDICTED RV) / PREDICTED RV  |  Positive = IV rich, Negative = IV cheap")
 
     grid_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
-    max_grid_months = 8
+    max_grid_months = 11
 
     # Load predicted RV from verdad workbook
     verdad_overall = {}
@@ -1289,6 +1335,109 @@ if active_tab == "POWER GRID":
     else:
         predicted_rv_overall = verdad_overall
         predicted_rv_monthly = verdad_monthly
+
+    # --- Editable Predicted RV Matrix (before grid calculation) ---
+    # Build contract-code labels for each commodity so we can populate the table
+    def _pg_contract_labels(comm):
+        """Return ordered list of (contract_month_int, contract_code) up to max_grid_months."""
+        sub = df[(df['date'] == selected_date) & (df['commodity'] == comm)].sort_values('contract_month')
+        result = []
+        for _, r in sub.iterrows():
+            cm = int(r['contract_month'])
+            if cm > max_grid_months:
+                break
+            exp = pd.to_datetime(r.get('expiry', None), errors='coerce')
+            if pd.isna(exp):
+                code = f"M{cm}"
+            else:
+                code = build_contract_labels_from_expiry(pd.Series([exp]), comm).iloc[0]
+            result.append((cm, str(code)))
+        return result
+
+    # Collect all unique contract codes across commodities (in sorted order)
+    _pg_month_rank = {'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6, 'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12}
+    def _pg_sort_key(code):
+        s = str(code) if pd.notna(code) else ""
+        if len(s) < 2:
+            return (9999, 99)
+        try:
+            yy = int(s[1:])
+        except Exception:
+            yy = 9999
+        return (yy, _pg_month_rank.get(s[0], 99))
+
+    _pg_label_map = {c: _pg_contract_labels(c) for c in grid_commodities}
+    _pg_all_codes = set()
+    for _pg_pairs in _pg_label_map.values():
+        for _, code in _pg_pairs:
+            _pg_all_codes.add(code)
+    _pg_all_codes = sorted(_pg_all_codes, key=_pg_sort_key)
+
+    # Build options-month-code mapping for verdad lookup: contract_code -> options_month_letter
+    _pg_cm_to_optcode = {}
+    for c in grid_commodities:
+        _cm_codes = va.get_contract_options_month_codes(df, selected_date, c, max_grid_months)
+        for cm_int, opt_code in _cm_codes.items():
+            # map via label map
+            for _cm, _code in _pg_label_map.get(c, []):
+                if _cm == cm_int:
+                    _pg_cm_to_optcode[(c, _code)] = opt_code
+
+    # Build default RV table: rows = contract codes, columns = commodities
+    _rv_defaults = pd.DataFrame({'Contract': _pg_all_codes})
+    for c in grid_commodities:
+        _rv_defaults[c] = np.nan
+        for cm_int, code in _pg_label_map.get(c, []):
+            opt_code = _pg_cm_to_optcode.get((c, code), None)
+            if predicted_rv_monthly and c in predicted_rv_monthly and opt_code and opt_code in predicted_rv_monthly[c]:
+                val = predicted_rv_monthly[c][opt_code]
+            elif predicted_rv_overall and c in predicted_rv_overall:
+                val = predicted_rv_overall[c]
+            elif not verdad_loaded and c in manual_rv_inputs:
+                val = manual_rv_inputs[c]
+            else:
+                val = np.nan
+            hit = _rv_defaults['Contract'] == code
+            if hit.any():
+                _rv_defaults.loc[hit, c] = val
+
+    _rv_col_cfg = {
+        'Contract': st.column_config.TextColumn('Contract', disabled=True, width='small'),
+        **{c: st.column_config.NumberColumn(c, min_value=0.1, max_value=100.0, step=0.25, format='%.2f') for c in grid_commodities}
+    }
+
+    # Read previous edited values from session state (persisted from last render)
+    # data_editor stores state as {'edited_rows': {row_idx: {col: val}}, ...}
+    _rv_source = _rv_defaults.copy()
+    _prev_edited = st.session_state.get('power_rv_matrix_editor', None)
+    if isinstance(_prev_edited, dict) and 'edited_rows' in _prev_edited:
+        for row_idx, changes in _prev_edited['edited_rows'].items():
+            for col, val in changes.items():
+                if col in _rv_source.columns:
+                    _rv_source.loc[int(row_idx), col] = val
+
+    # Convert (possibly edited) table into predicted_rv dicts for grid calculation
+    _edited_rv_overall = {}
+    _edited_rv_monthly = {}
+    for c in grid_commodities:
+        if c not in _rv_source.columns:
+            continue
+        _col_vals = _rv_source[c].dropna()
+        if len(_col_vals) > 0:
+            _edited_rv_overall[c] = float(_col_vals.mean())
+        _edited_rv_monthly[c] = {}
+        for _, row in _rv_source.iterrows():
+            code = row['Contract']
+            val = row[c]
+            if pd.isna(val):
+                continue
+            opt_code = _pg_cm_to_optcode.get((c, code), None)
+            if opt_code:
+                _edited_rv_monthly[c][opt_code] = float(val)
+
+    # Use edited values for grid calculation
+    predicted_rv_overall = _edited_rv_overall if _edited_rv_overall else predicted_rv_overall
+    predicted_rv_monthly = _edited_rv_monthly if any(_edited_rv_monthly.values()) else predicted_rv_monthly
 
     st.markdown("---")
 
@@ -1400,8 +1549,6 @@ if active_tab == "POWER GRID":
         st.markdown("")  # spacer
 
         # Expandable reference tables
-        col_ref1, col_ref2 = st.columns(2)
-
         def _matrix_to_contract_grid(src_df: pd.DataFrame) -> pd.DataFrame:
             """Convert commodity x M# matrix to Contract x Commodity display."""
             if src_df is None or len(src_df) == 0:
@@ -1422,6 +1569,8 @@ if active_tab == "POWER GRID":
                         out.loc[hit, c] = v
             return out
 
+        col_ref1, col_ref2 = st.columns(2)
+
         with col_ref1:
             with st.expander("FWD VOL MATRIX"):
                 if len(fwd_vols_df) > 0:
@@ -1436,15 +1585,16 @@ if active_tab == "POWER GRID":
 
         with col_ref2:
             with st.expander("PREDICTED RV MATRIX"):
-                if len(pred_rvs_df) > 0:
-                    rv_disp = _matrix_to_contract_grid(pred_rvs_df)
-                    rv_cols = [c for c in grid_commodities if c in rv_disp.columns]
-                    st.dataframe(
-                        rv_disp.style.format({col: '{:.2f}' for col in rv_cols}, na_rep='—'),
-                        use_container_width=True,
-                        hide_index=True,
-                        height=min(420, 80 + 30 * len(rv_disp))
-                    )
+                st.caption("Defaults from " + ("Verdad model" if verdad_loaded else "manual inputs") + ". Edit any cell to override.")
+                st.data_editor(
+                    _rv_defaults,
+                    column_config=_rv_col_cfg,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows='fixed',
+                    key='power_rv_matrix_editor',
+                    height=min(440, 80 + 35 * len(_rv_defaults))
+                )
 
         # Legend
         st.markdown("""
@@ -1463,7 +1613,7 @@ if active_tab == "POWER GRID":
 # TAB: IV CALENDAR
 # ============================================================================
 if active_tab == "IV CALENDAR":
-    cal_col, _ = st.columns([0.5, 4.5])
+    cal_col, _ = st.columns([0.75, 4.25])
     with cal_col:
         cal_commodity = st.selectbox(
             "Product",
@@ -1598,12 +1748,113 @@ if active_tab == "IV CALENDAR":
         )
 
 # ============================================================================
+# TAB: HEAT MAP (IV Calendar sub-tab)
+# ============================================================================
+if active_tab == "HEAT MAP":
+    current_tp = va._date_to_time_period(selected_date)
+
+    # Get current + next 6 time periods (wrapping around the 36-period cycle)
+    tp_order = va._TIME_PERIOD_ORDER
+    if current_tp in tp_order:
+        tp_idx = tp_order.index(current_tp)
+        hm_periods = [tp_order[(tp_idx + i) % len(tp_order)] for i in range(7)]
+    else:
+        hm_periods = tp_order[:7]
+
+    st.caption(f"Current vs Median across all products  |  Current period: {current_tp}  |  (positive = above seasonal)")
+
+    def _hm_cell_style(val):
+        if pd.isna(val):
+            return ''
+        v = float(val)
+        if v > 2:
+            return 'background-color: #1f4d2e; color: #e6edf3; font-weight: 600;'
+        if v > 0:
+            return 'background-color: #214e36; color: #e6edf3;'
+        if v > -2:
+            return 'background-color: #5a1f2a; color: #e6edf3;'
+        return 'background-color: #6b2330; color: #e6edf3; font-weight: 600;'
+
+    # Helper to get current IV series for a commodity
+    def _hm_get_current_iv(commodity_name):
+        cdata = df[
+            (df['date'] == selected_date) & (df['commodity'] == commodity_name)
+        ].copy()
+        if len(cdata) == 0:
+            return pd.Series(dtype=float)
+        cdata['expiry'] = pd.to_datetime(cdata['expiry'], errors='coerce')
+        _mapping = va.load_options_mapping()
+        _em_sub = _mapping[_mapping['COMMODITY'] == commodity_name.upper()]
+        _em_to_opt = {
+            int(r['EXPIRY_MONTH']): r['OPTIONS']
+            for _, r in _em_sub.iterrows()
+            if pd.notna(r.get('EXPIRY_MONTH'))
+        }
+        cdata['options_code'] = cdata['expiry'].dt.month.map(_em_to_opt)
+        cdata = cdata.dropna(subset=['options_code', 'dirty_vol'])
+        if len(cdata) == 0:
+            return pd.Series(dtype=float)
+        cdata = cdata.sort_values('expiry').drop_duplicates(subset=['options_code'], keep='first')
+        return cdata.set_index('options_code')['dirty_vol']
+
+    hm_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
+
+    for hm_comm in hm_commodities:
+        # Compute median grid
+        _, hm_med_grid = va.compute_iv_calendar_grid(master_df, hm_comm)
+        if len(hm_med_grid) == 0:
+            st.markdown(f"**{hm_comm}**")
+            st.warning(f"No data for {hm_comm}.")
+            continue
+
+        hm_current_iv = _hm_get_current_iv(hm_comm)
+        hm_value_cols = list(hm_med_grid.columns)
+
+        # Build rows: current IV - median for each time period
+        # Same live IVs compared against each period's seasonal median,
+        # showing whether today's term structure is rich/cheap vs seasonal norms.
+        hm_rows = []
+        for tp in hm_periods:
+            if tp not in hm_med_grid.index:
+                continue
+            med_row = hm_med_grid.loc[tp]
+            row_vals = {}
+            if len(hm_current_iv) > 0:
+                for code in hm_value_cols:
+                    if code in hm_current_iv.index and pd.notna(med_row.get(code)):
+                        row_vals[code] = float(hm_current_iv[code]) - float(med_row[code])
+                    else:
+                        row_vals[code] = np.nan
+            else:
+                for code in hm_value_cols:
+                    row_vals[code] = np.nan
+            hm_rows.append((tp, row_vals))
+
+        if not hm_rows:
+            st.markdown(f"**{hm_comm}**")
+            st.warning(f"No matching periods for {hm_comm}.")
+            continue
+
+        hm_heat_df = pd.DataFrame([r for _, r in hm_rows],
+                                   index=[tp for tp, _ in hm_rows])
+        hm_heat_df.index.name = 'Period'
+
+        st.markdown(f"**{hm_comm}**")
+        st.dataframe(
+            hm_heat_df.style
+                .format({col: '{:+.2f}' for col in hm_value_cols}, na_rep='—')
+                .applymap(_hm_cell_style, subset=hm_value_cols),
+            use_container_width=True,
+            hide_index=False
+        )
+
+# ============================================================================
 # TAB: SPREAD BUILDER
 # ============================================================================
 if active_tab == "SPREAD BUILDER":
     # Keep selectors narrow; place Run All on the right edge with spacer
     sb_col1, sb_col2, sb_col3, sb_col_range, sb_col_toggle, sb_col_spacer, sb_col_run = st.columns(
-        [1, 1, 1, 1.35, 1.0, 3.5, 1.35],
+        [1.5, 1, 1, 1.35, 1.5, 2.5, 1.35],
         vertical_alignment="bottom"
     )
     with sb_col1:
@@ -2669,11 +2920,24 @@ if active_tab == "VAR CAL":
             for c in _COMMODITIES:
                 st.session_state["varcal_var_values"][evt][c] = float(row[c])
 
+    # Save custom weights to JSON for snapshot generator
+    _weights_path = Path("snapshots/varcal_weights.json")
+    _weights_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import json as _json
+        _weights_path.write_text(_json.dumps(st.session_state["varcal_var_values"], indent=2))
+    except Exception:
+        pass
+
     # Reset button
     if st.button("Reset to defaults", key="varcal_reset"):
         st.session_state["varcal_var_values"] = {
             evt: dict(vals) for evt, vals in _DEFAULT_VAR.items()
         }
+        # Also reset saved weights file
+        _weights_path = Path("snapshots/varcal_weights.json")
+        if _weights_path.exists():
+            _weights_path.unlink()
         st.rerun()
 
     st.markdown("---")
@@ -3400,13 +3664,17 @@ if active_tab == "VAR RATIOS":
     prices_df = load_price_data()
 
     if prices_df is not None and len(prices_df) > 0:
-        # Product, front month, and lookback selectors on one row (narrowed; lookback +10% width)
-        col_prod, col_front, col_lookback, _ = st.columns([1, 1, 1.1, 6.9])
+        # Product, front month, and lookback selectors on one row
+        # Front month and lookback are widened by 15%.
+        col_prod, col_front, col_lookback, _ = st.columns(
+            [1.2, 1.15, 1.265, 6.385],
+            vertical_alignment="bottom"
+        )
 
         with col_prod:
             price_product = st.selectbox(
                 "Product",
-                ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW'],
+                ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL'],
                 index=0,
                 key="price_sheet_product"
             )
