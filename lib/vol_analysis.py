@@ -46,7 +46,13 @@ def load_master_data(filepath='data/master_vol_skew.csv'):
     Load master historical vol/skew dataset and derive contract_month by
     ordering expiries for each date/commodity.
     """
-    df = pd.read_csv(filepath, parse_dates=['date', 'expiry'])
+    df = pd.read_csv(filepath)
+    # Robust mixed-format datetime parsing (master file can contain both
+    # M/D/YYYY and YYYY-MM-DD strings).
+    for col in ['date', 'expiry']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce', format='mixed')
+    df = df[df['date'].notna() & df['expiry'].notna()].copy()
     # Derive contract_month by sorting expiries for each date/commodity
     df = df.sort_values(['date', 'commodity', 'expiry'])
     df['contract_month'] = (
@@ -1046,7 +1052,7 @@ def calculate_power_grid(df, date, predicted_rv_dict, commodities=None, max_mont
                 pred_rv = predicted_rv_dict[commodity]
 
             if pred_rv is not None and pred_rv > 0:
-                power = (fwd_vol - pred_rv) / fwd_vol * 100  # as percentage
+                power = (fwd_vol - pred_rv) / pred_rv * 100  # IV premium over predicted RV, in vol terms
                 row[f'M{cm}'] = power
                 fv_row[f'M{cm}'] = fwd_vol
                 pr_row[f'M{cm}'] = pred_rv
