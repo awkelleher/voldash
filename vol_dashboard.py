@@ -986,13 +986,16 @@ elif active_section == "Price Sheet":
     ]
     active_tab = st.radio("View", price_tab_options, horizontal=True, key="active_tab_price")
     price_product = None
-    if active_tab in ["VAR RATIOS", "REALIZED VOL"]:
-        price_product = st.selectbox(
-            "Product",
-            ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW'],
-            index=0,
-            key="price_sheet_product"
-        )
+    if active_tab == "REALIZED VOL":
+        # Narrow product selector to half its previous width (now ~10% of row)
+        col_prod, _ = st.columns([1, 9])
+        with col_prod:
+            price_product = st.selectbox(
+                "Product",
+                ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW'],
+                index=0,
+                key="price_sheet_product"
+            )
 elif active_section == "Skew Analyzer":
     st.markdown('<div class="bloomberg-header"><span>SKEW ANALYZER</span></div>', unsafe_allow_html=True)
     active_tab = "SKEW"
@@ -1021,7 +1024,8 @@ if active_tab == "FWD VOL CURVE":
     st.markdown('<div class="bloomberg-header"><span>FWD VOL CURVE</span></div>', unsafe_allow_html=True)
     st.caption("Forward volatility curve by commodity — built from market IVs. Implied Dirty Vol = current market IV.")
 
-    _fvc_commodities = ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW']
+    # Display order requested: SOY, MEAL, CORN, WHEAT, KW, OIL
+    _fvc_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
     _fvc_max_months = 12
 
     # Row labels matching the screenshot layout
@@ -1171,7 +1175,7 @@ if active_tab == "FWD VOL CURVE":
 
             col_data = [
                 str(_label),                                                    # Month (contract code)
-                f"{_var_day_var:.4f}" if _var_day_var is not None else "",     # Variance Day Variance
+                f"{_var_day_var:.0f}" if _var_day_var is not None else "",     # Variance Day Variance (0 decimals)
                 f"{_var_day_vol:.2f}" if _var_day_vol is not None else "",     # Variance Day Vol
                 f"{_clean_vol:.2f}" if _clean_vol is not None else "",         # Implied Clean Vol
                 f"{_dirty_vol:.2f}" if _dirty_vol is not None else "",         # Implied Dirty Vol = market IV
@@ -1459,12 +1463,14 @@ if active_tab == "POWER GRID":
 # TAB: IV CALENDAR
 # ============================================================================
 if active_tab == "IV CALENDAR":
-    cal_commodity = st.selectbox(
-        "Product",
-        ['SOY', 'MEAL', 'SM-S', 'CORN', 'WHEAT', 'KW', 'OIL'],
-        index=0,
-        key="iv_cal_commodity"
-    )
+    cal_col, _ = st.columns([0.5, 4.5])
+    with cal_col:
+        cal_commodity = st.selectbox(
+            "Product",
+            ['SOY', 'MEAL', 'SM-S', 'CORN', 'WHEAT', 'KW', 'OIL'],
+            index=0,
+            key="iv_cal_commodity"
+        )
 
     # Use master_df (full history, not just lookback) for seasonal averages
     if cal_commodity == 'SM-S':
@@ -1595,7 +1601,11 @@ if active_tab == "IV CALENDAR":
 # TAB: SPREAD BUILDER
 # ============================================================================
 if active_tab == "SPREAD BUILDER":
-    sb_col1, sb_col2, sb_col3 = st.columns(3)
+    # Keep selectors narrow; place Run All on the right edge with spacer
+    sb_col1, sb_col2, sb_col3, sb_col_range, sb_col_toggle, sb_col_spacer, sb_col_run = st.columns(
+        [1, 1, 1, 1.35, 1.0, 3.5, 1.35],
+        vertical_alignment="bottom"
+    )
     with sb_col1:
         sb_commodity = st.selectbox(
             "Commodity",
@@ -1608,17 +1618,15 @@ if active_tab == "SPREAD BUILDER":
         sb_month1 = st.selectbox("Month 1", _all_codes, index=3, key="sb_month1")  # default J
     with sb_col3:
         sb_month2 = st.selectbox("Month 2", _all_codes, index=4, key="sb_month2")  # default K
-
-    # Normalize toggle + range input + Run All button
-    norm_col1, norm_col2, norm_col3 = st.columns([1, 1, 1])
-    with norm_col1:
-        sb_run_all = st.button("Run All", key="sb_run_all", use_container_width=True)
-    with norm_col2:
-        sb_normalize = st.toggle("Normalize", value=False, key="sb_normalize")
-    with norm_col3:
+    _sb_norm_enabled = st.session_state.get("sb_normalize", False)
+    with sb_col_range:
         sb_norm_range = st.number_input(
-            "+/- Range", min_value=0.1, max_value=50.0, value=2.5, step=0.5,
-            key="sb_norm_range", disabled=not sb_normalize)
+            "Vol band", min_value=0.1, max_value=50.0, value=2.5, step=0.5,
+            key="sb_norm_range", disabled=not _sb_norm_enabled)
+    with sb_col_toggle:
+        sb_normalize = st.toggle("Normalize", value=_sb_norm_enabled, key="sb_normalize")
+    with sb_col_run:
+        sb_run_all = st.button("Run All", key="sb_run_all", use_container_width=True)
 
     # ── "Run All" – show all consecutive IV spreads from live data ─────────
     if sb_run_all:
@@ -2416,7 +2424,9 @@ if active_tab in ["VOL CHANGE", "VOL CHANGES"]:
     st.markdown('<div class="bloomberg-header"><span>VOL CHANGE</span></div>', unsafe_allow_html=True)
     st.caption("IV and Forward Vol change grids by contract and commodity")
 
-    long_window = st.selectbox("Lookback (trading days)", list(range(1, 21)), index=4, key="vol_change_lookback")
+    col_lb, _ = st.columns([0.324, 1.676])  # shrink width by an additional ~10%
+    with col_lb:
+        long_window = st.selectbox("Lookback (trading days)", list(range(1, 21)), index=4, key="vol_change_lookback")
     max_months = 12
 
     vol_change_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
@@ -2900,12 +2910,14 @@ if active_tab == "SKEW":
         default_front_opt = 'H'
     default_idx = month_codes.index(default_front_opt) if default_front_opt in month_codes else 2
 
-    front_opt_override = st.selectbox(
-        "Front options month (override)",
-        month_codes,
-        index=default_idx,
-        help="Select which front-month options contract to use for all commodities in this view."
-    )
+    col_front_opt, _ = st.columns([0.15, 0.85])  # shrink width by ~50% from prior
+    with col_front_opt:
+        front_opt_override = st.selectbox(
+            "Front options month",
+            month_codes,
+            index=default_idx,
+            help="Select which front-month options contract to use for all commodities in this view."
+        )
 
     skew_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
     lookback_years = lookback_years_from_days(lookback)
@@ -3205,12 +3217,15 @@ if active_tab == "CORRELATIONS":
             st.warning("No correlation windows found in cache/correlation_matrices.csv")
         else:
             default_idx = windows.index(20) if 20 in windows else 0
-            corr_window = st.selectbox(
-                "Correlation Window (days)",
-                windows,
-                index=default_idx,
-                key="correlation_window_days"
-            )
+            # Shrink selector width by ~60%
+            col_window, _ = st.columns([0.4, 1.6])
+            with col_window:
+                corr_window = st.selectbox(
+                    "Correlation Window (days)",
+                    windows,
+                    index=default_idx,
+                    key="correlation_window_days"
+                )
 
             wdf = corr_df[corr_df['window'] == corr_window].copy()
             if len(wdf) == 0:
@@ -3385,22 +3400,29 @@ if active_tab == "VAR RATIOS":
     prices_df = load_price_data()
 
     if prices_df is not None and len(prices_df) > 0:
-        # Front options month selector
-        col1, col2, col3 = st.columns([1, 1, 2])
+        # Product, front month, and lookback selectors on one row (narrowed; lookback +10% width)
+        col_prod, col_front, col_lookback, _ = st.columns([1, 1, 1.1, 6.9])
 
-        with col1:
+        with col_prod:
+            price_product = st.selectbox(
+                "Product",
+                ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW'],
+                index=0,
+                key="price_sheet_product"
+            )
+
+        with col_front:
             front_month = st.selectbox(
                 "Front Month",
                 ['H', 'K', 'N', 'Q', 'U', 'X', 'F'],
                 index=0,
                 help="Select the front options month to view variance ratios"
             )
+        # Map options month to futures month for display (aligned left under selectors)
+        futures_month = vr.options_to_futures(front_month, price_product)
+        st.caption(f"Underlying futures: {futures_month}")
 
-            # Map options month to futures month for display
-            futures_month = vr.options_to_futures(front_month, price_product)
-            st.caption(f"Underlying futures: {futures_month}")
-
-        with col2:
+        with col_lookback:
             lookback_years = st.selectbox(
                 "Lookback (Years)",
                 [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, None],
@@ -3478,7 +3500,7 @@ if active_tab == "VAR RATIOS":
 
             # ---- Variance Ratios - Used (editable, drives forward vol) ----
             st.markdown("---")
-            st.subheader("Variance Ratios - Used")
+            st.subheader("Variance Ratios Used in Fwd Vol Calc")
             st.caption("Edit these values to override what is used in Forward Vol calculation. "
                        "Click 'Load from Historical' to reset to the current historical averages above.")
 
