@@ -13,6 +13,222 @@ from lib import variance_ratios as vr
 from lib import price_analysis as pa
 from datetime import datetime, timedelta
 
+# Shared CME holiday set — used by VAR CAL and FWD VOL CURVE
+CME_HOLIDAYS = {
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26",
+    "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06",
+    "2027-11-25", "2027-12-24",
+    # 2028
+    "2028-01-01", "2028-01-17", "2028-02-21", "2028-04-14",
+    "2028-05-29", "2028-06-19", "2028-07-04", "2028-09-04",
+    "2028-11-23", "2028-12-25",
+}
+
+
+def count_trading_days(start_date, end_date) -> int:
+    """Count trading days (Mon–Fri, excluding CME holidays) from start_date to end_date inclusive."""
+    count = 0
+    cur = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    while cur <= end:
+        if cur.weekday() < 5 and cur.strftime("%Y-%m-%d") not in CME_HOLIDAYS:
+            count += 1
+        cur += timedelta(days=1)
+    return count
+
+
+# Shared USDA/WASDE events — used by VAR CAL and FWD VOL CURVE
+CME_EVENTS = {
+    # 2026
+    "2026-01-12": "Grain Stock - Jan",
+    "2026-02-10": "Crop Production - Out",
+    "2026-03-10": "Crop Production - Out",
+    "2026-03-31": "Grain Stock - Mar & Planting",
+    "2026-04-09": "Crop Production - Out",
+    "2026-05-12": "Crop Production - Out",
+    "2026-06-11": "Crop Production - Out",
+    "2026-06-30": "Grain Stock - Jun",
+    "2026-07-10": "Crop Production - Out",
+    "2026-08-12": "Crop Production - Aug",
+    "2026-09-11": "Crop Production - Sep",
+    "2026-09-30": "Grain Stock - Sep",
+    "2026-10-09": "Crop Production - Oct",
+    "2026-11-10": "Crop Production - Nov",
+    "2026-12-10": "Crop Production - Out",
+    # 2027
+    "2027-01-11": "Grain Stock - Jan",
+    "2027-02-09": "Crop Production - Out",
+    "2027-03-09": "Crop Production - Out",
+    "2027-03-31": "Grain Stock - Mar & Planting",
+    "2027-04-08": "Crop Production - Out",
+    "2027-05-11": "Crop Production - Out",
+    "2027-06-10": "Crop Production - Out",
+    "2027-06-30": "Grain Stock - Jun",
+    "2027-07-09": "Crop Production - Out",
+    "2027-08-11": "Crop Production - Aug",
+    "2027-09-10": "Crop Production - Sep",
+    "2027-09-30": "Grain Stock - Sep",
+    "2027-10-08": "Crop Production - Oct",
+    "2027-11-09": "Crop Production - Nov",
+    "2027-12-09": "Crop Production - Out",
+    # 2028
+    "2028-01-10": "Grain Stock - Jan",
+    "2028-02-08": "Crop Production - Out",
+    "2028-03-08": "Crop Production - Out",
+    "2028-03-29": "Grain Stock - Mar & Planting",
+    "2028-04-11": "Crop Production - Out",
+    "2028-05-09": "Crop Production - Out",
+    "2028-06-08": "Crop Production - Out",
+    "2028-06-30": "Grain Stock - Jun",
+    "2028-07-12": "Crop Production - Out",
+    "2028-08-10": "Crop Production - Aug",
+    "2028-09-12": "Crop Production - Sep",
+    "2028-09-29": "Grain Stock - Sep",
+    "2028-10-11": "Crop Production - Oct",
+    "2028-11-09": "Crop Production - Nov",
+    "2028-12-12": "Crop Production - Out",
+}
+
+# Shared default variance weights — used by VAR CAL and FWD VOL CURVE
+CME_DEFAULT_VAR = {
+    "Day":                          {"SOY": 1.0,  "MEAL": 1.0,  "OIL": 1.0,  "CORN": 1.0,  "WHEAT": 1.0,  "KW": 1.0},
+    "Weekend (W)":                  {"SOY": 0.15, "MEAL": 0.15, "OIL": 0.15, "CORN": 0.15, "WHEAT": 0.15, "KW": 0.15},
+    "Holiday (H)":                  {"SOY": 0.15, "MEAL": 0.15, "OIL": 0.15, "CORN": 0.15, "WHEAT": 0.15, "KW": 0.15},
+    "Grain Stock - Jan":            {"SOY": 4.5,  "MEAL": 5.5,  "OIL": 3.2,  "CORN": 7.5,  "WHEAT": 7.5,  "KW": 7.5},
+    "Grain Stock - Mar & Planting": {"SOY": 2.5,  "MEAL": 2.5,  "OIL": 2.7,  "CORN": 3.0,  "WHEAT": 1.5,  "KW": 1.5},
+    "Grain Stock - Jun":            {"SOY": 3.0,  "MEAL": 3.0,  "OIL": 3.0,  "CORN": 3.0,  "WHEAT": 3.0,  "KW": 3.0},
+    "Grain Stock - Sep":            {"SOY": 2.6,  "MEAL": 3.0,  "OIL": 1.5,  "CORN": 3.6,  "WHEAT": 2.5,  "KW": 2.5},
+    "Crop Production - Aug":        {"SOY": 2.5,  "MEAL": 2.5,  "OIL": 1.5,  "CORN": 3.0,  "WHEAT": 1.5,  "KW": 1.5},
+    "Crop Production - Sep":        {"SOY": 2.0,  "MEAL": 2.0,  "OIL": 1.5,  "CORN": 2.0,  "WHEAT": 1.5,  "KW": 1.5},
+    "Crop Production - Oct":        {"SOY": 3.0,  "MEAL": 3.0,  "OIL": 3.0,  "CORN": 2.5,  "WHEAT": 3.0,  "KW": 3.0},
+    "Crop Production - Nov":        {"SOY": 4.0,  "MEAL": 4.0,  "OIL": 3.0,  "CORN": 4.0,  "WHEAT": 1.5,  "KW": 1.5},
+    "Crop Production - Out":        {"SOY": 1.0,  "MEAL": 1.0,  "OIL": 1.0,  "CORN": 1.0,  "WHEAT": 1.0,  "KW": 1.0},
+}
+
+
+def compute_variance_days(commodity: str, end_date, var_vals: dict) -> float:
+    """
+    Sum variance weights from today through end_date (inclusive) for a given commodity,
+    using the VAR CAL event/holiday/weekend weighting logic.
+    var_vals: dict of {event_type: {commodity: weight}} — uses session state if available.
+    """
+    total = 0.0
+    cur = pd.Timestamp(datetime.now().date())
+    end = pd.Timestamp(end_date)
+    while cur <= end:
+        dstr = cur.strftime("%Y-%m-%d")
+        dow = cur.weekday()
+        is_weekend = dow >= 5
+        is_holiday = dstr in CME_HOLIDAYS
+        event = CME_EVENTS.get(dstr, "")
+        if is_holiday:
+            etype = "Holiday (H)"
+        elif is_weekend:
+            etype = "Weekend (W)"
+        elif event and event in var_vals:
+            etype = event
+        else:
+            etype = "Day"
+        total += var_vals.get(etype, {}).get(commodity, 1.0)
+        cur += timedelta(days=1)
+    return total
+
+
+def compute_fvc_vols(df, commodity: str, date, var_vals: dict, used_matrix=None, vr_matrix=None, max_months: int = 12) -> dict:
+    """
+    Compute variance-day vols (forward vols via variance stripping) for a commodity.
+    Returns {contract_month_int: var_day_vol} for all contracts up to max_months.
+    M1 = clean vol, M2+ = variance-stripped forward vol.
+    """
+    import lib.variance_ratios as _vr
+    sub = (
+        df[(df['date'] == date) & (df['commodity'] == commodity)]
+        .sort_values('expiry')
+        .head(max_months)
+        .reset_index(drop=True)
+    )
+    if len(sub) == 0:
+        return {}
+
+    labels = build_contract_labels_from_expiry(sub['expiry'], commodity)
+    expiries = [pd.Timestamp(r.expiry) for r in sub.itertuples()]
+    today_ts = pd.Timestamp(datetime.now().date())
+    var_365 = compute_variance_days(commodity, today_ts + timedelta(days=365), var_vals)
+
+    # Load variance ratio matrices if not supplied
+    if vr_matrix is None or used_matrix is None:
+        front_label = str(labels.iloc[0])
+        front_options_month = ''.join(filter(str.isalpha, front_label))
+        _vr_matrix, _ = _vr.load_cached_variance_ratios(commodity, front_options_month)
+        vr_matrix = _vr_matrix
+        used_matrix = None  # caller can pass session state value
+
+    # Precompute adjacent-pair ratios
+    adjacent_ratios = []
+    for j in range(len(labels) - 1):
+        next_label = str(labels.iloc[j + 1])
+        col_display = "VarRat to FM" if j == 0 else f"VarRat to {j + 1}FM"
+        col_raw = f"VarRat{j + 1}"
+        ratio = None
+        if used_matrix is not None and not used_matrix.empty:
+            if next_label in used_matrix.index and col_display in used_matrix.columns:
+                v = used_matrix.loc[next_label, col_display]
+                if pd.notna(v):
+                    ratio = float(v)
+        if ratio is None and vr_matrix is not None and not vr_matrix.empty:
+            if next_label in vr_matrix.index and col_raw in vr_matrix.columns:
+                ratio = float(vr_matrix.loc[next_label, col_raw])
+        adjacent_ratios.append(ratio if ratio is not None else 1.0)
+
+    result = {}
+    cumulative_mvd = 0.0
+    prior_month_var_days = []
+    prior_var_day_var = []
+
+    for i, row in enumerate(sub.itertuples()):
+        this_expiry = expiries[i]
+        total_trd_days = count_trading_days(today_ts, this_expiry)
+        variance_days = compute_variance_days(commodity, this_expiry, var_vals)
+        month_var_days = variance_days - cumulative_mvd
+        cumulative_mvd += month_var_days
+
+        dirty_vol = row.dirty_vol if pd.notna(row.dirty_vol) else None
+        if dirty_vol and variance_days > 0 and var_365 > 0:
+            clean_vol = ((dirty_vol ** 2 / 251 * total_trd_days) / variance_days * var_365) ** 0.5
+        else:
+            clean_vol = None
+
+        if i == 0:
+            var_day_vol = clean_vol
+            var_day_var = clean_vol ** 2 if clean_vol is not None else None
+        else:
+            fwd_vol = None
+            if clean_vol is not None and month_var_days > 0:
+                sp = sum(
+                    (adjacent_ratios[j] if j < len(adjacent_ratios) else 1.0) * pmvd * pvdv
+                    for j, (pmvd, pvdv) in enumerate(zip(prior_month_var_days, prior_var_day_var))
+                )
+                inner = (clean_vol ** 2 * variance_days - sp) / month_var_days
+                if inner > 0:
+                    fwd_vol = inner ** 0.5
+            var_day_vol = fwd_vol
+            var_day_var = fwd_vol ** 2 if fwd_vol is not None else None
+
+        prior_month_var_days.append(month_var_days)
+        prior_var_day_var.append(var_day_var if var_day_var is not None else 0.0)
+
+        cm_int = int(row.contract_month) if hasattr(row, 'contract_month') else (i + 1)
+        if var_day_vol is not None:
+            result[cm_int] = var_day_vol
+
+    return result
+
+
 if "theme_mode" not in st.session_state:
     st.session_state["theme_mode"] = "Dark"
 
@@ -29,13 +245,22 @@ def load_data():
     """Load historical data with caching"""
     return va.load_historical_data()
 
+
+def get_file_mtime(path: str) -> float:
+    """Return file mtime for cache-busting (0 when unavailable)."""
+    try:
+        return float(os.path.getmtime(path)) if os.path.exists(path) else 0.0
+    except Exception:
+        return 0.0
+
+
 @st.cache_data
-def load_master():
+def load_master(_cache_key: float = 0.0):
     """Load master historical vol/skew data (for percentiles/skew)"""
     return va.load_master_data()
 
 @st.cache_data(ttl=10)
-def load_live_data():
+def load_live_data(_cache_key: float = 0.0):
     """Load live vol/skew CSV overlay if available."""
     try:
         if os.path.exists('data/live_vols.csv'):
@@ -297,11 +522,25 @@ def build_vol_change_table(
         return pd.DataFrame(), {"error": "No historical dates available"}
 
     asof = pd.to_datetime(selected_date)
-    idx = int(dates.searchsorted(asof, side='right') - 1)
-    if idx < 0:
-        return pd.DataFrame(), {"error": f"No data on/before {asof.date()}"}
-
-    current_date = dates[idx]
+    # Current date/source rule:
+    # Prefer latest live_vols snapshot (commodity-level). If unavailable, use
+    # latest merged date on/before selected date.
+    current_source = "merged"
+    current_date = pd.NaT
+    if live_df is not None and len(live_df) > 0:
+        lsub = live_df[live_df['commodity'] == commodity].copy()
+        if len(lsub) > 0:
+            lsub['date'] = pd.to_datetime(lsub['date'], errors='coerce')
+            ldates = pd.DatetimeIndex(lsub['date'].dropna().sort_values().unique())
+            if len(ldates) > 0:
+                current_date = ldates[-1]
+                current_source = "live"
+    if pd.isna(current_date):
+        idx = int(dates.searchsorted(asof, side='right') - 1)
+        if idx < 0:
+            return pd.DataFrame(), {"error": f"No data on/before {asof.date()}"}
+        current_date = dates[idx]
+        current_source = "merged"
 
     # Reference dates for change calculations come from MASTER history only.
     # 1D = latest master date; ND = Nth-latest master date.
@@ -312,15 +551,26 @@ def build_vol_change_table(
     else:
         master_dates = dates
 
-    master_dates = master_dates[master_dates <= current_date]
     if len(master_dates) == 0:
         return pd.DataFrame(), {"error": f"No master history available for {commodity}"}
 
+    # 1D baseline = absolute latest available master date.
     prev_date = master_dates[-1] if len(master_dates) >= 1 else None
     long_date = master_dates[-long_window] if len(master_dates) >= long_window else None
 
-    current = cdf[cdf['date'] == current_date][['contract_month', 'expiry', 'dirty_vol', 'fwd_vol']].copy()
-    current = current.sort_values(['contract_month', 'expiry']).drop_duplicates(subset=['expiry'], keep='first').head(max_months)
+    if current_source == "live" and live_df is not None and len(live_df) > 0:
+        current = live_df[
+            (pd.to_datetime(live_df['date'], errors='coerce') == current_date) &
+            (live_df['commodity'] == commodity)
+        ][['expiry', 'dirty_vol', 'fwd_vol']].copy()
+        current['expiry'] = pd.to_datetime(current['expiry'], errors='coerce')
+        current = current.sort_values('expiry').drop_duplicates(subset=['expiry'], keep='first').head(max_months)
+        current['contract_month'] = np.arange(1, len(current) + 1)
+        current = current[['contract_month', 'expiry', 'dirty_vol', 'fwd_vol']]
+    else:
+        current = cdf[cdf['date'] == current_date][['contract_month', 'expiry', 'dirty_vol', 'fwd_vol']].copy()
+        current = current.sort_values(['contract_month', 'expiry']).drop_duplicates(subset=['expiry'], keep='first').head(max_months)
+
     current = current.rename(columns={'dirty_vol': 'iv_now', 'fwd_vol': 'fwd_now'})
 
     current['contract_code'] = build_contract_labels_from_expiry(current['expiry'], commodity)
@@ -336,11 +586,43 @@ def build_vol_change_table(
         if 'expiry' in ref_base.columns:
             ref_base['expiry'] = pd.to_datetime(ref_base['expiry'], errors='coerce')
 
+    def _fill_missing_baseline_by_code(out_df, iv_col, fwd_col, cutoff_date):
+        """
+        If exact cutoff-date baseline is missing for a contract code, backfill from
+        the latest available master row for that same code on/before cutoff_date.
+        """
+        if cutoff_date is None:
+            return out_df
+        if iv_col not in out_df.columns or fwd_col not in out_df.columns:
+            return out_df
+        miss_mask = out_df[iv_col].isna() | out_df[fwd_col].isna()
+        if not miss_mask.any():
+            return out_df
+
+        hist = ref_base[ref_base['date'] <= cutoff_date][['date', 'expiry', 'dirty_vol', 'fwd_vol']].copy()
+        if len(hist) == 0:
+            return out_df
+        hist['contract_code'] = build_contract_labels_from_expiry(hist['expiry'], commodity)
+        hist = hist[hist['contract_code'].notna()].copy()
+        if len(hist) == 0:
+            return out_df
+        hist = hist.sort_values(['contract_code', 'date']).drop_duplicates(subset=['contract_code'], keep='last')
+        hist = hist.rename(columns={'dirty_vol': f'{iv_col}_fb', 'fwd_vol': f'{fwd_col}_fb'})
+        out_df = out_df.merge(hist[['contract_code', f'{iv_col}_fb', f'{fwd_col}_fb']], on='contract_code', how='left')
+        out_df[iv_col] = out_df[iv_col].fillna(out_df[f'{iv_col}_fb'])
+        out_df[fwd_col] = out_df[fwd_col].fillna(out_df[f'{fwd_col}_fb'])
+        out_df = out_df.drop(columns=[f'{iv_col}_fb', f'{fwd_col}_fb'])
+        return out_df
+
     if prev_date is not None:
         prev = ref_base[ref_base['date'] == prev_date][['expiry', 'dirty_vol', 'fwd_vol']].copy()
         prev = prev.sort_values('expiry').drop_duplicates(subset=['expiry'], keep='last')
+        prev['contract_code'] = build_contract_labels_from_expiry(prev['expiry'], commodity)
+        prev = prev[prev['contract_code'].notna()].copy()
+        prev = prev.drop_duplicates(subset=['contract_code'], keep='last')
         prev = prev.rename(columns={'dirty_vol': 'iv_prev_1d', 'fwd_vol': 'fwd_prev_1d'})
-        out = out.merge(prev, on='expiry', how='left')
+        out = out.merge(prev[['contract_code', 'iv_prev_1d', 'fwd_prev_1d']], on='contract_code', how='left')
+        out = _fill_missing_baseline_by_code(out, 'iv_prev_1d', 'fwd_prev_1d', prev_date)
         out['iv_chg_1d'] = out['iv_now'] - out['iv_prev_1d']
         out['fwd_chg_1d'] = out['fwd_now'] - out['fwd_prev_1d']
     else:
@@ -350,8 +632,12 @@ def build_vol_change_table(
     if long_date is not None:
         long_df = ref_base[ref_base['date'] == long_date][['expiry', 'dirty_vol', 'fwd_vol']].copy()
         long_df = long_df.sort_values('expiry').drop_duplicates(subset=['expiry'], keep='last')
+        long_df['contract_code'] = build_contract_labels_from_expiry(long_df['expiry'], commodity)
+        long_df = long_df[long_df['contract_code'].notna()].copy()
+        long_df = long_df.drop_duplicates(subset=['contract_code'], keep='last')
         long_df = long_df.rename(columns={'dirty_vol': 'iv_prev_long', 'fwd_vol': 'fwd_prev_long'})
-        out = out.merge(long_df, on='expiry', how='left')
+        out = out.merge(long_df[['contract_code', 'iv_prev_long', 'fwd_prev_long']], on='contract_code', how='left')
+        out = _fill_missing_baseline_by_code(out, 'iv_prev_long', 'fwd_prev_long', long_date)
         out['iv_chg_long'] = out['iv_now'] - out['iv_prev_long']
         out['fwd_chg_long'] = out['fwd_now'] - out['fwd_prev_long']
     else:
@@ -579,6 +865,7 @@ NAV_SECTIONS = [
     "IV Calendar",
     "Spread Builder",
     "Trading Calendar",
+    "Var Cal",
     "Settings",
 ]
 default_section = st.session_state.get("active_section", "Vol Sheet")
@@ -617,7 +904,7 @@ with st.sidebar:
 if active_section is None:
     active_section = "Vol Sheet"
 
-if active_section not in ["Vol Sheet", "Price Sheet", "Skew Analyzer", "IV Calendar", "Spread Builder", "Trading Calendar", "Settings"]:
+if active_section not in ["Vol Sheet", "Price Sheet", "Skew Analyzer", "IV Calendar", "Spread Builder", "Trading Calendar", "Var Cal", "Settings"]:
     st.markdown(f'<div class="bloomberg-header"><span>{active_section.upper()}</span></div>', unsafe_allow_html=True)
     st.info(f"{active_section} view is coming soon.")
     st.stop()
@@ -637,9 +924,9 @@ if active_section == "Settings":
 # Load data
 try:
     df = load_data()
-    master_df = load_master()
+    master_df = load_master(get_file_mtime('data/master_vol_skew.csv'))
     master_base_df = master_df.copy()
-    live_df = load_live_data()
+    live_df = load_live_data(get_file_mtime('data/live_vols.csv'))
 
     # Ensure datetime for date columns
     for frame in [df, master_df]:
@@ -686,6 +973,7 @@ if active_section == "Vol Sheet":
         "POWER GRID",
         "VOL CHANGES",
         "IV Percentiles",
+        "FWD VOL CURVE",
     ]
     active_tab = st.radio("View", tab_options, horizontal=True, key="active_tab_vol")
     price_product = None
@@ -721,13 +1009,217 @@ elif active_section == "Trading Calendar":
     st.markdown('<div class="bloomberg-header"><span>TRADING CALENDAR</span></div>', unsafe_allow_html=True)
     active_tab = "TRADING CALENDAR"
     price_product = None
+elif active_section == "Var Cal":
+    st.markdown('<div class="bloomberg-header"><span>VAR CAL</span></div>', unsafe_allow_html=True)
+    active_tab = "VAR CAL"
+    price_product = None
+
+# ============================================================================
+# TAB: FWD VOL CURVE
+# ============================================================================
+if active_tab == "FWD VOL CURVE":
+    st.markdown('<div class="bloomberg-header"><span>FWD VOL CURVE</span></div>', unsafe_allow_html=True)
+    st.caption("Forward volatility curve by commodity — built from market IVs. Implied Dirty Vol = current market IV.")
+
+    _fvc_commodities = ['SOY', 'MEAL', 'OIL', 'CORN', 'WHEAT', 'KW']
+    _fvc_max_months = 12
+
+    # Row labels matching the screenshot layout
+    _fvc_row_labels = [
+        "Month",
+        "Variance Day Variance",
+        "Variance Day Vol",
+        "Implied Clean Vol",
+        "Implied Dirty Vol",
+        "Month Variance Days",
+        "Month Trading Days",
+        "Variance Days",
+        "Total Trading Days",
+        "Expiration",
+    ]
+
+    # Get the latest date snapshot from df
+    _fvc_date = df['date'].max() if df is not None and len(df) > 0 else None
+
+    for _comm in _fvc_commodities:
+        st.markdown(f"**{_comm}**")
+
+        if _fvc_date is None:
+            st.warning("No data available.")
+            continue
+
+        # Filter to this commodity on the latest date, sorted by expiry (front first)
+        _fvc_sub = (
+            df[(df['date'] == _fvc_date) & (df['commodity'] == _comm)]
+            .sort_values('expiry')
+            .head(_fvc_max_months)
+            .reset_index(drop=True)
+        )
+
+        if len(_fvc_sub) == 0:
+            st.caption(f"No data for {_comm}.")
+            continue
+
+        # Build contract code labels (e.g. N26, F27)
+        _fvc_labels = build_contract_labels_from_expiry(_fvc_sub['expiry'], _comm)
+
+        # Build grid: rows = metrics, columns = contract months
+        _fvc_grid = {"": _fvc_row_labels}
+
+        # Build sorted list of expiry Timestamps for prior-month boundary lookups
+        _fvc_expiries = [pd.Timestamp(_r.expiry) for _r in _fvc_sub.itertuples()]
+
+        _var_vals = st.session_state.get("varcal_var_values", CME_DEFAULT_VAR)
+        _today_ts = pd.Timestamp(datetime.now().date())
+        _cumulative_month_var_days = 0.0  # running sum of prior Month Variance Days
+
+        # Total variance days over the next 365 calendar days (normalizing constant per commodity)
+        _var_365 = compute_variance_days(_comm, _today_ts + timedelta(days=365), _var_vals)
+
+        # Load variance ratio matrix for this commodity keyed to current front options month
+        _front_label = str(_fvc_labels.iloc[0])
+        _front_options_month = ''.join(filter(str.isalpha, _front_label))
+        _vr_matrix, _ = vr.load_cached_variance_ratios(_comm, _front_options_month)
+
+        # Prefer editable "Variance Ratios - Used" from session state if available
+        _ss_key = f"varrat_used_{_comm}_{_front_options_month}"
+        _used_matrix = st.session_state.get(_ss_key, None)
+
+        # Precompute adjacent-pair ratios: _adjacent_ratios[j] = contract[j+1] / contract[j]
+        # e.g. [0]=K/H, [1]=N/K, [2]=Q/N, [3]=U/Q, ...
+        # Session state uses display col names ("VarRat to FM", "VarRat to 2FM", ...)
+        # Raw cache uses ("VarRat1", "VarRat2", ...)
+        _adjacent_ratios = []
+        for _j in range(len(_fvc_labels) - 1):
+            _next_label = str(_fvc_labels.iloc[_j + 1])
+            _col_display = "VarRat to FM" if _j == 0 else f"VarRat to {_j + 1}FM"
+            _col_raw = f"VarRat{_j + 1}"
+            _ratio = None
+            # Try editable session state first
+            if _used_matrix is not None and not _used_matrix.empty:
+                if _next_label in _used_matrix.index and _col_display in _used_matrix.columns:
+                    _v = _used_matrix.loc[_next_label, _col_display]
+                    if pd.notna(_v):
+                        _ratio = float(_v)
+            # Fallback to raw cache
+            if _ratio is None and not _vr_matrix.empty:
+                if _next_label in _vr_matrix.index and _col_raw in _vr_matrix.columns:
+                    _ratio = float(_vr_matrix.loc[_next_label, _col_raw])
+            _adjacent_ratios.append(_ratio if _ratio is not None else 1.0)
+
+        # Accumulators for SUMPRODUCT across prior contracts
+        _prior_labels = []
+        _prior_month_var_days = []
+        _prior_var_day_var = []
+
+        for _i, (_label, _row) in enumerate(zip(_fvc_labels, _fvc_sub.itertuples())):
+            _expiry_str = pd.Timestamp(_row.expiry).strftime("%m/%d/%Y") if pd.notna(_row.expiry) else ""
+            _this_expiry = _fvc_expiries[_i]
+
+            # Total Trading Days: trading days from today through this expiry
+            _total_trd_days = count_trading_days(_today_ts, _this_expiry)
+
+            # Month Trading Days: trading days from day after prior expiry through this expiry
+            # Front month (i=0): from today through this expiry (same as total)
+            if _i == 0:
+                _month_trd_days = _total_trd_days
+            else:
+                _month_start = _fvc_expiries[_i - 1] + timedelta(days=1)
+                _month_trd_days = count_trading_days(_month_start, _this_expiry)
+
+            # Variance Days: cumulative VAR CAL variance sum from today through this expiry
+            _variance_days = compute_variance_days(_comm, _this_expiry, _var_vals)
+
+            # Month Variance Days: variance days this contract holds while front month
+            # = total Variance Days minus sum of all preceding Month Variance Days
+            _month_var_days = _variance_days - _cumulative_month_var_days
+            _cumulative_month_var_days += _month_var_days
+
+            # Implied Clean Vol: ((dirty_vol^2 / 251 * total_trading_days) / variance_days * var_365) ^ 0.5
+            _dirty_vol = _row.dirty_vol if pd.notna(_row.dirty_vol) else None
+            if _dirty_vol and _variance_days > 0 and _var_365 > 0:
+                _clean_vol = ((_dirty_vol ** 2 / 251 * _total_trd_days) / _variance_days * _var_365) ** 0.5
+            else:
+                _clean_vol = None
+
+            # Variance Day Vol and Variance Day Variance
+            # M1: equals Clean Vol / Clean Vol^2
+            # M2+: forward vol via variance stripping (replicates Ladder!F4 Excel formula)
+            if _i == 0:
+                _var_day_vol = _clean_vol
+                _var_day_var = _clean_vol ** 2 if _clean_vol is not None else None
+            else:
+                _fwd_vol = None
+                if _clean_vol is not None and _month_var_days > 0:
+                    # SUMPRODUCT(adjacent_ratios[j], MonthVarDays[j], VarDayVariance[j])
+                    # adjacent_ratios[j] = contract[j+1]/contract[j]: K/H, N/K, Q/N, ...
+                    _sp = 0.0
+                    for _j, (_pmvd, _pvdv) in enumerate(
+                            zip(_prior_month_var_days, _prior_var_day_var)):
+                        _ratio = _adjacent_ratios[_j] if _j < len(_adjacent_ratios) else 1.0
+                        _sp += _ratio * _pmvd * _pvdv
+                    _inner = (_clean_vol ** 2 * _variance_days - _sp) / _month_var_days
+                    if _inner > 0:
+                        _fwd_vol = _inner ** 0.5
+                _var_day_vol = _fwd_vol
+                _var_day_var = _fwd_vol ** 2 if _fwd_vol is not None else None
+
+            # Store this contract's values for subsequent iterations' SUMPRODUCT
+            _prior_labels.append(str(_label))
+            _prior_month_var_days.append(_month_var_days)
+            _prior_var_day_var.append(_var_day_var if _var_day_var is not None else 0.0)
+
+            col_data = [
+                str(_label),                                                    # Month (contract code)
+                f"{_var_day_var:.4f}" if _var_day_var is not None else "",     # Variance Day Variance
+                f"{_var_day_vol:.2f}" if _var_day_vol is not None else "",     # Variance Day Vol
+                f"{_clean_vol:.2f}" if _clean_vol is not None else "",         # Implied Clean Vol
+                f"{_dirty_vol:.2f}" if _dirty_vol is not None else "",         # Implied Dirty Vol = market IV
+                f"{_month_var_days:.2f}",                                       # Month Variance Days
+                str(_month_trd_days),                                           # Month Trading Days
+                f"{_variance_days:.2f}",                                        # Variance Days (cumulative)
+                str(_total_trd_days),                                           # Total Trading Days (today → expiry)
+                _expiry_str,                                                    # Expiration
+            ]
+            _fvc_grid[_expiry_str or str(_i)] = col_data
+
+        _fvc_df = pd.DataFrame(_fvc_grid)
+
+        # Persist computed vols to session state (also done unconditionally at Power Grid tab)
+        st.session_state[f"fvc_vols_{_comm}"] = compute_fvc_vols(
+            df, _comm, _fvc_date, _var_vals,
+            used_matrix=st.session_state.get(f"varrat_used_{_comm}_{_front_options_month}"),
+            vr_matrix=_vr_matrix,
+        )
+
+        # Style: highlight Implied Dirty Vol row (index 4) in a distinct color
+        def _fvc_style(row, row_labels=_fvc_row_labels):
+            label = row.iloc[0]
+            if label == "Month":
+                return ["background-color: #1c2333; color: #c8d8f0; font-weight: bold;"] * len(row)
+            if label == "Implied Dirty Vol":
+                return ["background-color: #1a2a1a; color: #a0d4a0; font-weight: bold;"] * len(row)
+            if label == "Expiration":
+                return ["background-color: #1c2333; color: #8b9db5;"] * len(row)
+            return [""] * len(row)
+
+        _fvc_styled = _fvc_df.style.apply(_fvc_style, axis=1)
+
+        st.dataframe(
+            _fvc_styled,
+            use_container_width=True,
+            hide_index=True,
+            height=36 + 28 * len(_fvc_row_labels),
+        )
+
+        st.markdown("")  # spacer between commodity grids
 
 # ============================================================================
 # TAB 0: POWER GRID
 # ============================================================================
 if active_tab == "POWER GRID":
     st.markdown('<div class="bloomberg-header"><span>POWER GRID</span></div>', unsafe_allow_html=True)
-    st.caption("(FWD VOL - PREDICTED RV) / FWD VOL  |  Positive = IV rich, Negative = IV cheap")
+    st.caption("(FWD VOL - PREDICTED RV) / PREDICTED RV  |  Positive = IV rich, Negative = IV cheap")
 
     grid_commodities = ['SOY', 'MEAL', 'CORN', 'WHEAT', 'KW', 'OIL']
     max_grid_months = 8
@@ -795,6 +1287,29 @@ if active_tab == "POWER GRID":
         predicted_rv_monthly = verdad_monthly
 
     st.markdown("---")
+
+    # Always compute FWD VOL CURVE vols (variance-stripped forward vols) so Power Grid
+    # uses them regardless of whether the FWD VOL CURVE tab has been visited this session.
+    _pg_var_vals = st.session_state.get("varcal_var_values", CME_DEFAULT_VAR)
+    _pg_fvc_date = df['date'].max() if df is not None and len(df) > 0 else selected_date
+    for _pg_comm in grid_commodities:
+        _pg_front_label = None
+        _pg_sub = df[(df['date'] == _pg_fvc_date) & (df['commodity'] == _pg_comm)].sort_values('expiry')
+        if len(_pg_sub) > 0:
+            _pg_labels = build_contract_labels_from_expiry(_pg_sub['expiry'], _pg_comm)
+            _pg_front_label = ''.join(filter(str.isalpha, str(_pg_labels.iloc[0])))
+        _pg_used = st.session_state.get(f"varrat_used_{_pg_comm}_{_pg_front_label}", None) if _pg_front_label else None
+        st.session_state[f"fvc_vols_{_pg_comm}"] = compute_fvc_vols(
+            df, _pg_comm, _pg_fvc_date, _pg_var_vals, used_matrix=_pg_used
+        )
+
+    # Patch fwd_vol with FWD VOL CURVE variance-stripped forward vols
+    df = df.copy()
+    for _pg_comm in grid_commodities:
+        _fvc_ss = st.session_state.get(f"fvc_vols_{_pg_comm}", {})
+        for _pg_cm, _pg_vol in _fvc_ss.items():
+            _mask = (df['date'] == selected_date) & (df['commodity'] == _pg_comm) & (df['contract_month'] == _pg_cm)
+            df.loc[_mask, 'fwd_vol'] = _pg_vol
 
     # Calculate the power grid
     power_df, power_meta = va.calculate_power_grid(
@@ -1080,9 +1595,6 @@ if active_tab == "IV CALENDAR":
 # TAB: SPREAD BUILDER
 # ============================================================================
 if active_tab == "SPREAD BUILDER":
-    # Reserve top area so current spread/IV metrics can render above controls.
-    top_metrics_container = st.container()
-
     sb_col1, sb_col2, sb_col3 = st.columns(3)
     with sb_col1:
         sb_commodity = st.selectbox(
@@ -1097,14 +1609,174 @@ if active_tab == "SPREAD BUILDER":
     with sb_col3:
         sb_month2 = st.selectbox("Month 2", _all_codes, index=4, key="sb_month2")  # default K
 
-    # Normalize toggle + range input
-    norm_col1, norm_col2 = st.columns([1, 3])
+    # Normalize toggle + range input + Run All button
+    norm_col1, norm_col2, norm_col3 = st.columns([1, 1, 1])
     with norm_col1:
-        sb_normalize = st.toggle("Normalize", value=False, key="sb_normalize")
+        sb_run_all = st.button("Run All", key="sb_run_all", use_container_width=True)
     with norm_col2:
+        sb_normalize = st.toggle("Normalize", value=False, key="sb_normalize")
+    with norm_col3:
         sb_norm_range = st.number_input(
             "+/- Range", min_value=0.1, max_value=50.0, value=2.5, step=0.5,
             key="sb_norm_range", disabled=not sb_normalize)
+
+    # ── "Run All" – show all consecutive IV spreads from live data ─────────
+    if sb_run_all:
+        _mapping_df = va.load_options_mapping()
+        _em_sub = _mapping_df[_mapping_df['COMMODITY'] == sb_commodity.upper()]
+        _em_to_opt = {
+            int(r['EXPIRY_MONTH']): r['OPTIONS']
+            for _, r in _em_sub.iterrows()
+            if pd.notna(r.get('EXPIRY_MONTH'))
+        }
+        _opt_to_em = {v: k for k, v in _em_to_opt.items()}
+
+        # Determine which source has data and gather all available IVs
+        _ra_source = "live_vols"
+        _ra_vols = {}   # options_month -> dirty_vol
+        _ra_asof = pd.NaT
+
+        if live_df is not None and len(live_df) > 0:
+            _ra_sub = live_df[live_df['commodity'] == sb_commodity].copy()
+            _ra_sub['date'] = pd.to_datetime(_ra_sub['date'], errors='coerce')
+            _ra_sub = _ra_sub[_ra_sub['date'].notna()]
+            if len(_ra_sub) > 0:
+                _ra_le = _ra_sub[_ra_sub['date'] <= selected_date]
+                _ra_asof = _ra_le['date'].max() if len(_ra_le) > 0 else _ra_sub['date'].max()
+                _ra_day = _ra_sub[_ra_sub['date'] == _ra_asof].copy()
+                _ra_day['expiry'] = pd.to_datetime(_ra_day['expiry'], errors='coerce')
+                _ra_day = _ra_day.dropna(subset=['expiry', 'dirty_vol'])
+                _ra_day['options_code'] = _ra_day['expiry'].dt.month.map(_em_to_opt)
+                _ra_day = _ra_day.dropna(subset=['options_code'])
+                _ra_day = _ra_day.sort_values('expiry').drop_duplicates(
+                    subset=['options_code'], keep='first')
+                _ra_vols = dict(zip(_ra_day['options_code'], _ra_day['dirty_vol']))
+
+        if len(_ra_vols) < 2:
+            _ra_source = "snapshot fallback"
+            _ra_msub = df[df['commodity'] == sb_commodity].copy()
+            _ra_msub['date'] = pd.to_datetime(_ra_msub['date'], errors='coerce')
+            _ra_msub = _ra_msub[_ra_msub['date'].notna()]
+            if len(_ra_msub) > 0:
+                _ra_le = _ra_msub[_ra_msub['date'] <= selected_date]
+                _ra_asof = _ra_le['date'].max() if len(_ra_le) > 0 else _ra_msub['date'].max()
+                _ra_day = _ra_msub[_ra_msub['date'] == _ra_asof].copy()
+                _ra_day['expiry'] = pd.to_datetime(_ra_day['expiry'], errors='coerce')
+                _ra_day = _ra_day.dropna(subset=['expiry', 'dirty_vol'])
+                _ra_day['options_code'] = _ra_day['expiry'].dt.month.map(_em_to_opt)
+                _ra_day = _ra_day.dropna(subset=['options_code'])
+                _ra_day = _ra_day.sort_values('expiry').drop_duplicates(
+                    subset=['options_code'], keep='first')
+                _ra_vols = dict(zip(_ra_day['options_code'], _ra_day['dirty_vol']))
+
+        # Determine front month from live data (nearest DTE)
+        _ra_avail = sorted(_ra_vols.keys(), key=lambda m: _all_codes.index(m) if m in _all_codes else 99)
+        if len(_ra_avail) >= 2:
+            # Front month = the one in live data with the smallest expiry month
+            # relative to the data date.  Use the order from live DTE.
+            if live_df is not None and len(live_df) > 0:
+                _ra_front_sub = live_df[
+                    (live_df['commodity'] == sb_commodity)
+                ].copy()
+                _ra_front_sub['date'] = pd.to_datetime(_ra_front_sub['date'], errors='coerce')
+                _ra_front_sub['expiry'] = pd.to_datetime(_ra_front_sub['expiry'], errors='coerce')
+                _ra_front_sub = _ra_front_sub[_ra_front_sub['date'] == _ra_asof]
+                if len(_ra_front_sub) > 0:
+                    _ra_front_row = _ra_front_sub.loc[
+                        (_ra_front_sub['expiry'] - _ra_front_sub['date']).dt.days.idxmin()
+                    ]
+                    _ra_front_em = _ra_front_row['expiry'].month
+                    _ra_front_month = _em_to_opt.get(int(_ra_front_em), _ra_avail[0])
+                else:
+                    _ra_front_month = _ra_avail[0]
+            else:
+                _ra_front_month = _ra_avail[0]
+
+            # Build consecutive pairs from ALL available live contracts
+            # ordered from front month through the 12-month cycle.
+            # Serial months are included — percentile/median will show n/a
+            # when no precomputed history exists for that pair.
+            _ra_ordered = []
+            if _ra_front_month in _all_codes:
+                start_idx = _all_codes.index(_ra_front_month)
+                for i in range(12):
+                    code = _all_codes[(start_idx + i) % 12]
+                    if code in _ra_vols:
+                        _ra_ordered.append(code)
+
+            _ra_pairs = [(_ra_ordered[i], _ra_ordered[i + 1])
+                         for i in range(len(_ra_ordered) - 1)]
+
+            if _ra_pairs:
+                # Load precomputed spread percentile distribution for medians + percentile lookup
+                _ra_spread_dist = pd.DataFrame()
+                _ra_lookup_fn = None
+                try:
+                    from scripts.iv_spread_percentiles_precompute import (
+                        load_iv_spread_percentile_dist, lookup_iv_spread_percentile,
+                    )
+                    _ra_spread_dist = load_iv_spread_percentile_dist(
+                        commodity=sb_commodity, front_options_month=_ra_front_month)
+                    _ra_lookup_fn = lookup_iv_spread_percentile
+                except Exception:
+                    pass
+
+                _ra_asof_txt = pd.to_datetime(_ra_asof).strftime('%Y-%m-%d') if pd.notna(_ra_asof) else "n/a"
+                st.markdown("---")
+                st.markdown(
+                    f"**ALL CONSECUTIVE SPREADS** — {sb_commodity} | Front: **{_ra_front_month}** | "
+                    f"Source: `{_ra_source}` | As of: `{_ra_asof_txt}`"
+                )
+
+                # Display spreads in rows of 3 metric boxes
+                _ra_n = len(_ra_pairs)
+                for row_start in range(0, _ra_n, 3):
+                    row_pairs = _ra_pairs[row_start:row_start + 3]
+                    cols = st.columns(len(row_pairs))
+                    for col_idx, (m1, m2) in enumerate(row_pairs):
+                        with cols[col_idx]:
+                            _v1 = _ra_vols.get(m1, np.nan)
+                            _v2 = _ra_vols.get(m2, np.nan)
+                            _sprd = _v1 - _v2 if pd.notna(_v1) and pd.notna(_v2) else np.nan
+
+                            # Look up median and percentile from precomputed distribution
+                            _pair_str = f"{m1}-{m2}"
+                            _median = np.nan
+                            _pctile = np.nan
+                            if not _ra_spread_dist.empty:
+                                _dist_row = _ra_spread_dist[
+                                    _ra_spread_dist['SPREAD_PAIR'] == _pair_str
+                                ]
+                                if len(_dist_row) > 0:
+                                    _median = _dist_row.iloc[0].get('spread_p50', np.nan)
+                            if _ra_lookup_fn is not None and pd.notna(_sprd):
+                                _lk = _ra_lookup_fn(_sprd, sb_commodity, _ra_front_month, _pair_str)
+                                if _lk.get("percentile") is not None:
+                                    _pctile = _lk["percentile"] * 100.0
+
+                            # Build delta string: percentile (matching CURRENT SPREAD style)
+                            if pd.notna(_pctile):
+                                _delta_txt = f"{_pctile:.0f}th %ile"
+                            else:
+                                _delta_txt = None
+
+                            # Display metric box
+                            st.metric(
+                                f"{m1}-{m2} Spread",
+                                f"{_sprd:+.2f}" if pd.notna(_sprd) else "—",
+                                delta=_delta_txt,
+                            )
+                            # Caption: median + leg IVs
+                            _v1_txt = f"{_v1:.2f}" if pd.notna(_v1) else "—"
+                            _v2_txt = f"{_v2:.2f}" if pd.notna(_v2) else "—"
+                            _med_txt = f"Median: {_median:+.2f}" if pd.notna(_median) else "Median: n/a"
+                            st.caption(f"{_med_txt}  |  {m1}: {_v1_txt}  |  {m2}: {_v2_txt}")
+
+                st.markdown("---")
+            else:
+                st.warning("Not enough contracts in live data to form consecutive pairs.")
+        else:
+            st.warning("Not enough contracts available to compute spreads.")
 
     if sb_month1 == sb_month2:
         st.warning("Month 1 and Month 2 must be different.")
@@ -1201,23 +1873,22 @@ if active_tab == "SPREAD BUILDER":
             # Top box above the grid: current spread from live_vols.
             source_asof = live_asof if spread_source == "live_vols" else merged_asof
             source_asof_txt = pd.to_datetime(source_asof).strftime('%Y-%m-%d') if pd.notna(source_asof) else "n/a"
-            with top_metrics_container:
-                box_col1, box_col2, box_col3 = st.columns([1.2, 1, 1])
-                with box_col1:
-                    st.metric(
-                        f"Current Spread ({sb_month1}-{sb_month2})",
-                        f"{current_spread:+.2f}" if pd.notna(current_spread) else "—",
-                        delta=(f"{pct:.0f}th %ile ({current_tp})" if pd.notna(pct) else None)
-                    )
-                with box_col2:
-                    st.metric(f"{sb_month1} IV", f"{current_v1:.2f}" if pd.notna(current_v1) else "—")
-                with box_col3:
-                    st.metric(f"{sb_month2} IV", f"{current_v2:.2f}" if pd.notna(current_v2) else "—")
-                caption_parts = [f"Source: `{spread_source}` | As of: `{source_asof_txt}`"]
-                if sb_normalize and pd.notna(current_v1):
-                    caption_parts.append(
-                        f"| **Normalized**: {sb_month1} IV {current_v1 - sb_norm_range:.1f} – {current_v1 + sb_norm_range:.1f} ({len(sb_detail)} obs)")
-                st.caption("  ".join(caption_parts))
+            box_col1, box_col2, box_col3 = st.columns([1.2, 1, 1])
+            with box_col1:
+                st.metric(
+                    f"Current Spread ({sb_month1}-{sb_month2})",
+                    f"{current_spread:+.2f}" if pd.notna(current_spread) else "—",
+                    delta=(f"{pct:.0f}th %ile ({current_tp})" if pd.notna(pct) else None)
+                )
+            with box_col2:
+                st.metric(f"{sb_month1} IV", f"{current_v1:.2f}" if pd.notna(current_v1) else "—")
+            with box_col3:
+                st.metric(f"{sb_month2} IV", f"{current_v2:.2f}" if pd.notna(current_v2) else "—")
+            caption_parts = [f"Source: `{spread_source}` | As of: `{source_asof_txt}`"]
+            if sb_normalize and pd.notna(current_v1):
+                caption_parts.append(
+                    f"| **Normalized**: {sb_month1} IV {current_v1 - sb_norm_range:.1f} – {current_v1 + sb_norm_range:.1f} ({len(sb_detail)} obs)")
+            st.caption("  ".join(caption_parts))
 
             # Header info
             info_parts = [f"**{sb_commodity} {sb_month1}-{sb_month2}**"]
@@ -1908,6 +2579,181 @@ if active_tab == "TRADING CALENDAR":
     st.dataframe(usda_df, use_container_width=True, hide_index=True, height=380)
 
 # ============================================================================
+# TAB: VAR CAL (Philatron-style variance calendar)
+# ============================================================================
+if active_tab == "VAR CAL":
+    # ---- Static data: CME holidays and USDA/WASDE events ----
+    # Holiday names for display — keyed from the shared CME_HOLIDAYS set at top of file
+    _HOLIDAY_NAMES = {
+        "2026-01-01": "NYE",   "2026-01-19": "MLK",   "2026-02-16": "Pres",
+        "2026-04-03": "GF",    "2026-05-25": "Memorial", "2026-06-19": "Juneteenth",
+        "2026-07-03": "Indy",  "2026-09-07": "Labor", "2026-11-26": "Thanks",
+        "2026-12-25": "XMAS",
+        "2027-01-01": "NYE",   "2027-01-18": "MLK",   "2027-02-15": "Pres",
+        "2027-03-26": "GF",    "2027-05-31": "Memorial", "2027-06-18": "Juneteenth",
+        "2027-07-05": "Indy",  "2027-09-06": "Labor", "2027-11-25": "Thanks",
+        "2027-12-24": "XMAS",
+        "2028-01-01": "NYE",   "2028-01-17": "MLK",   "2028-02-21": "Pres",
+        "2028-04-14": "GF",    "2028-05-29": "Memorial", "2028-06-19": "Juneteenth",
+        "2028-07-04": "Indy",  "2028-09-04": "Labor", "2028-11-23": "Thanks",
+        "2028-12-25": "XMAS",
+    }
+    _VARCAL_HOLIDAYS = {d: _HOLIDAY_NAMES.get(d, "Holiday") for d in CME_HOLIDAYS}
+
+    # Use shared module-level events dict (copy so expiry injection is local to this tab)
+    _VARCAL_EVENTS = dict(CME_EVENTS)
+
+    # ---- Inject expiry dates from all products into the events dict ----
+    _expiry_dates = set()
+    if df is not None and 'expiry' in df.columns:
+        for _exp in df['expiry'].dropna().unique():
+            try:
+                _expiry_dates.add(pd.Timestamp(_exp).strftime("%Y-%m-%d"))
+            except Exception:
+                pass
+    for _edate in sorted(_expiry_dates):
+        if _edate not in _VARCAL_EVENTS:
+            _VARCAL_EVENTS[_edate] = f"Expiry: {_edate}"
+
+    # ---- Event types and default weights (reference shared module-level dicts) ----
+    _COMMODITIES = ["SOY", "MEAL", "OIL", "CORN", "WHEAT", "KW"]
+    _EVENT_TYPES = list(CME_DEFAULT_VAR.keys())
+    _DEFAULT_VAR = CME_DEFAULT_VAR
+
+    # ---- Session state: var values (editable) ----
+    if "varcal_var_values" not in st.session_state:
+        st.session_state["varcal_var_values"] = {
+            evt: dict(vals) for evt, vals in CME_DEFAULT_VAR.items()
+        }
+
+    # ---- UI: Editable var values table ----
+    st.subheader("Event Variance Weights")
+    st.caption("Edit the variance contribution per event type per commodity. Normal day = 1.")
+
+    # Build the editable dataframe
+    _var_rows = []
+    for evt in _EVENT_TYPES:
+        row = {"Event": evt}
+        for c in _COMMODITIES:
+            row[c] = st.session_state["varcal_var_values"].get(evt, {}).get(c, 1.0)
+        _var_rows.append(row)
+    _var_df = pd.DataFrame(_var_rows)
+
+    _col_config = {"Event": st.column_config.TextColumn("Event", disabled=True)}
+    for c in _COMMODITIES:
+        _col_config[c] = st.column_config.NumberColumn(c, min_value=0.0, max_value=20.0, step=0.1, format="%.2f")
+
+    _edited_var = st.data_editor(
+        _var_df,
+        column_config=_col_config,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key="varcal_var_editor",
+    )
+
+    # Persist edits back to session state
+    for _, row in _edited_var.iterrows():
+        evt = row["Event"]
+        if evt in st.session_state["varcal_var_values"]:
+            for c in _COMMODITIES:
+                st.session_state["varcal_var_values"][evt][c] = float(row[c])
+
+    # Reset button
+    if st.button("Reset to defaults", key="varcal_reset"):
+        st.session_state["varcal_var_values"] = {
+            evt: dict(vals) for evt, vals in _DEFAULT_VAR.items()
+        }
+        st.rerun()
+
+    st.markdown("---")
+
+    # ---- Build the calendar ----
+    _today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    _end = _today + timedelta(days=365 * 2 + 31)  # ~24 months
+
+    def _varcal_classify(dt):
+        """Return (weekend_flag, holiday_flag, event_name) for a given date."""
+        dstr = dt.strftime("%Y-%m-%d")
+        dow = dt.weekday()  # 0=Mon, 6=Sun
+        is_weekend = dow >= 5  # Sat=5, Sun=6
+        holiday = _VARCAL_HOLIDAYS.get(dstr, "")
+        event = _VARCAL_EVENTS.get(dstr, "")
+        return is_weekend, holiday, event
+
+    def _varcal_var_for_day(is_weekend, holiday, event, commodity, var_vals):
+        """Return the variance value for a day."""
+        if holiday:
+            etype = "Holiday (H)"
+        elif is_weekend:
+            etype = "Weekend (W)"
+        elif event:
+            # Map event name to type key
+            etype = event if event in var_vals else "Day"
+        else:
+            etype = "Day"
+        return var_vals.get(etype, {}).get(commodity, 1.0)
+
+    # Build rows
+    _var_vals = st.session_state["varcal_var_values"]
+    _cal_rows = []
+    _cur = _today
+    while _cur <= _end:
+        is_weekend, holiday, event = _varcal_classify(_cur)
+        trading_day = 0 if (is_weekend or holiday) else 1
+        row = {
+            "Date": _cur.strftime("%Y-%m-%d"),
+            "Day": _cur.strftime("%a"),
+            "Wknd": "W" if is_weekend else "",
+            "Holiday": holiday,
+            "Event": event,
+            "Trd": trading_day,
+        }
+        for c in _COMMODITIES:
+            row[c] = _varcal_var_for_day(is_weekend, holiday, event, c, _var_vals)
+        _cal_rows.append(row)
+        _cur += timedelta(days=1)
+
+    _cal_df = pd.DataFrame(_cal_rows)
+
+    # ---- Cumulative summary by month ----
+    st.subheader("Monthly Variance Totals")
+    _cal_df["_month"] = pd.to_datetime(_cal_df["Date"]).dt.to_period("M")
+    _monthly = _cal_df.groupby("_month")[_COMMODITIES].sum().reset_index()
+    _monthly["Month"] = _monthly["_month"].astype(str)
+    _monthly = _monthly[["Month"] + _COMMODITIES]
+    _monthly_style = _monthly.style.format({c: "{:.2f}" for c in _COMMODITIES})
+    st.dataframe(_monthly_style, use_container_width=True, hide_index=True, height=min(700, 36 + 28 * len(_monthly)))
+
+    st.markdown("---")
+
+    # ---- Full calendar grid ----
+    st.subheader("Daily Calendar")
+    st.caption(f"Today: {_today.strftime('%Y-%m-%d')} → {_end.strftime('%Y-%m-%d')}  |  Weekend=W  |  Holiday=H  |  Normal day var=1")
+
+    # Style: highlight weekends, holidays, events
+    def _varcal_row_style(row):
+        styles = [""] * len(row)
+        if row["Wknd"] == "W":
+            return ["background-color: #1c2333; color: #8b9db5;"] * len(row)
+        if row["Holiday"]:
+            return ["background-color: #2a1f1f; color: #c0827a;"] * len(row)
+        if row["Event"]:
+            return ["background-color: #1f2a1f; color: #82c082;"] * len(row)
+        return styles
+
+    _cal_display = _cal_df.drop(columns=["_month"])
+    _cal_styled = _cal_display.style.apply(_varcal_row_style, axis=1).format(
+        {c: "{:.2f}" for c in _COMMODITIES}
+    )
+    st.dataframe(
+        _cal_styled,
+        use_container_width=True,
+        hide_index=True,
+        height=600,
+    )
+
+# ============================================================================
 # TAB 2: TERM STRUCTURE
 # ============================================================================
 if active_tab == "TERM STRUCT":
@@ -2577,32 +3423,51 @@ if active_tab == "VAR RATIOS":
             - Total trading days: {metadata['total_trading_days']}
             """)
 
-            # Style the dataframe
-            def highlight_diagonal(val):
-                """Highlight cells close to 1.0 (diagonal)"""
+            # --- Reshape to lower-triangle display matching screenshot ---
+            n_contracts = len(matrix_df)
+
+            # Rename VarRat1..N -> "VarRat to FM", "VarRat to 2FM", ...
+            col_rename = {}
+            for i in range(n_contracts):
+                old = f"VarRat{i+1}"
+                new = "VarRat to FM" if i == 0 else f"VarRat to {i+1}FM"
+                col_rename[old] = new
+            display_df = matrix_df.rename(columns=col_rename).copy()
+
+            # Trim to n-1 columns (last row has nothing further out to reference)
+            useful_cols = ["VarRat to FM"] + [f"VarRat to {i+1}FM" for i in range(1, n_contracts - 1)]
+            useful_cols = [c for c in useful_cols if c in display_df.columns]
+            display_df = display_df[useful_cols]
+
+            # Blank upper triangle only — keep diagonal (should be 1.0, shown green)
+            display_df = display_df.astype(float)
+            for row_i in range(len(display_df)):
+                for col_i in range(len(display_df.columns)):
+                    if col_i > row_i:
+                        display_df.iloc[row_i, col_i] = np.nan
+
+            # Style
+            def _vr_style(val):
                 if pd.isna(val):
                     return ''
                 if 0.99 <= val <= 1.01:
-                    return 'background-color: #1f4d2e; color: #e6edf3; font-weight: 600;'  # dark green
-                elif val < 0.7:
-                    return 'background-color: #5a1f2a; color: #e6edf3;'  # dark rose
+                    return 'background-color: #1f4d2e; color: #e6edf3; font-weight: 600;'
+                if val < 0.7:
+                    return 'background-color: #5a1f2a; color: #e6edf3;'
                 elif val > 1.3:
-                    return 'background-color: #1f3f5a; color: #e6edf3;'  # dark blue
+                    return 'background-color: #1f3f5a; color: #e6edf3;'
                 return ''
 
-            # Display the matrix
             st.dataframe(
-                matrix_df.style.applymap(highlight_diagonal).format("{:.2f}"),
+                display_df.style.applymap(_vr_style).format("{:.2f}", na_rep=""),
                 use_container_width=True,
-                height=450
+                height=36 + 28 * len(display_df),
             )
 
             st.caption("""
             **Reading the matrix:**
-            - Rows = contract being measured
-            - Columns = contract position on curve (VarRat1 = front, VarRat2 = 2nd, etc.)
-            - Cell = Variance(row) / Variance(column)
-            - Green = diagonal (1.0), Red = low ratio (<0.7), Blue = high ratio (>1.3)
+            - Rows = contract being measured  |  Columns = reference contract (FM = front, 2FM = second, etc.)
+            - Cell = Var(row contract) / Var(column reference)  |  Only shown where row is further out than column
             """)
 
             # Show the futures curve order
@@ -2610,6 +3475,44 @@ if active_tab == "VAR RATIOS":
                 curve = vr.get_futures_curve_for_front_month(futures_month, commodity)
                 curve_display = " → ".join([f"{i+1}FM: {m}" for i, m in enumerate(curve[:8])])
                 st.write(curve_display)
+
+            # ---- Variance Ratios - Used (editable, drives forward vol) ----
+            st.markdown("---")
+            st.subheader("Variance Ratios - Used")
+            st.caption("Edit these values to override what is used in Forward Vol calculation. "
+                       "Click 'Load from Historical' to reset to the current historical averages above.")
+
+            _ss_key = f"varrat_used_{price_product}_{front_month}"
+
+            # Seed from historical display_df if not yet in session state
+            if _ss_key not in st.session_state:
+                st.session_state[_ss_key] = display_df.copy()
+
+            _used_df = st.session_state[_ss_key].copy()
+
+            # Column config — all ratio columns editable numbers
+            _used_col_config = {}
+            for _col in _used_df.columns:
+                _used_col_config[_col] = st.column_config.NumberColumn(
+                    _col, min_value=0.0, max_value=5.0, step=0.01, format="%.2f"
+                )
+
+            _edited_used = st.data_editor(
+                _used_df,
+                column_config=_used_col_config,
+                use_container_width=True,
+                hide_index=False,
+                num_rows="fixed",
+                key=f"varrat_used_editor_{price_product}_{front_month}",
+            )
+
+            # Persist edits back to session state
+            st.session_state[_ss_key] = _edited_used.copy()
+
+            # Reset to current historical averages
+            if st.button("Load from Historical", key=f"varrat_load_hist_{price_product}_{front_month}"):
+                st.session_state[_ss_key] = display_df.copy()
+                st.rerun()
 
         else:
             if isinstance(metadata, dict) and metadata.get("error"):
